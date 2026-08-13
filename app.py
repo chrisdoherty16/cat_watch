@@ -1400,9 +1400,8 @@ def app():
     st.title("\U0001F310 Global Cat Watch")
     st.caption("GDACS + NHC + CAL FIRE catastrophe monitor with maps, news lookup and desktop alerts.")
     
-    # Clear peril filter on page load
-    if "selected_peril_filter" not in st.session_state:
-        st.session_state.selected_peril_filter = None
+    # Always reset peril filter on page load
+    st.session_state.selected_peril_filter = None
 
     with st.sidebar:
         st.header("Controls")
