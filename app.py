@@ -1468,33 +1468,49 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
-    # Quick peril filter buttons - multiselect mode
-    st.caption("Click perils to show/hide (or click map icon for that event):")
+    # Quick jump to event
+    st.caption("Or click to jump to an event:")
+    event_options = {f"{peril_icon(row['peril'])} {row['title'][:60]}": idx 
+                     for idx, (_, row) in enumerate(major.iterrows())}
+    if event_options:
+        selected_event = st.selectbox("", options=event_options.keys(), 
+                                     label_visibility="collapsed", key="event_jump")
+        if selected_event:
+            st.session_state.selected_peril_filter = major.iloc[event_options[selected_event]]["peril"]
+            st.rerun()
+    
+    # Quick peril filter buttons - single select mode
+    st.caption("Click a peril to filter alerts to that type only:")
     peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
     
-    # Initialize session state for button selections
-    if "filtered_perils" not in st.session_state:
-        st.session_state.filtered_perils = set()
+    # Initialize session state for button selection
+    if "selected_peril_filter" not in st.session_state:
+        st.session_state.selected_peril_filter = None
     
     cols = st.columns(len(peril_order))
     for idx, peril in enumerate(peril_order):
         with cols[idx]:
-            is_selected = peril in st.session_state.filtered_perils
-            button_label = f"✓ {peril_icon(peril)} {peril}" if is_selected else f"{peril_icon(peril)} {peril}"
-            if st.button(button_label, key=f"btn_{peril}", use_container_width=True):
-                if peril in st.session_state.filtered_perils:
-                    st.session_state.filtered_perils.discard(peril)
-                else:
-                    st.session_state.filtered_perils.add(peril)
-                st.rerun()
+            is_selected = st.session_state.selected_peril_filter == peril
+            if is_selected:
+                # Use theme color for selected button
+                button_label = f"✓ {peril_icon(peril)} {peril}"
+                if st.button(button_label, key=f"btn_{peril}", use_container_width=True, 
+                           help="Click again to clear filter"):
+                    st.session_state.selected_peril_filter = None
+                    st.rerun()
+            else:
+                button_label = f"{peril_icon(peril)} {peril}"
+                if st.button(button_label, key=f"btn_{peril}", use_container_width=True):
+                    st.session_state.selected_peril_filter = peril
+                    st.rerun()
     
     # Alerts list below map
     st.subheader("Critical & Watch Alerts")
     st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
     
-    # Filter: if perils selected, show only those; otherwise show all
-    if st.session_state.filtered_perils:
-        major_filtered = major[major["peril"].isin(st.session_state.filtered_perils)]
+    # Filter: if peril selected, show only that; otherwise show all
+    if st.session_state.selected_peril_filter:
+        major_filtered = major[major["peril"] == st.session_state.selected_peril_filter]
     else:
         major_filtered = major
     
