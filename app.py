@@ -1492,6 +1492,14 @@ def app():
                     st.session_state.selected_peril_filter = peril
                     st.rerun()
     
+    # Show selected peril highlight
+    if st.session_state.selected_peril_filter:
+        st.markdown(f"""
+        <div style="background-color:#16f9de;color:#0E1117;padding:10px;border-radius:6px;text-align:center;font-weight:bold;margin-top:8px">
+        ✓ Filtered to: {peril_icon(st.session_state.selected_peril_filter)} {st.session_state.selected_peril_filter}
+        </div>
+        """, unsafe_allow_html=True)
+    
     # Alerts list below map
     st.subheader("Critical & Watch Alerts")
     st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
