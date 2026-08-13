@@ -1468,17 +1468,6 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
-    # Quick jump to event
-    st.caption("Or click to jump to an event:")
-    event_options = {f"{peril_icon(row['peril'])} {row['title'][:60]}": idx 
-                     for idx, (_, row) in enumerate(major.iterrows())}
-    if event_options:
-        selected_event = st.selectbox("", options=event_options.keys(), 
-                                     label_visibility="collapsed", key="event_jump")
-        if selected_event:
-            st.session_state.selected_peril_filter = major.iloc[event_options[selected_event]]["peril"]
-            st.rerun()
-    
     # Quick peril filter buttons - single select mode
     st.caption("Click a peril to filter alerts to that type only:")
     peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
