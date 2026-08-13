@@ -1466,35 +1466,35 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
-    # Quick peril filter buttons (simulates clicking on map)
-    st.caption("Or click a peril to filter alerts:")
+    # Quick peril filter buttons - multiselect mode
+    st.caption("Click perils to filter alerts (select multiple):")
     peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
+    
+    # Initialize session state for button selections
+    if "selected_perils" not in st.session_state:
+        st.session_state.selected_perils = []
+    
     cols = st.columns(len(peril_order))
     for idx, peril in enumerate(peril_order):
         with cols[idx]:
-            if st.button(f"{peril_icon(peril)} {peril}", key=f"btn_{peril}", use_container_width=True):
-                st.session_state.alert_peril_filter = [peril]
+            is_selected = peril in st.session_state.selected_perils
+            button_label = f"✓ {peril_icon(peril)} {peril}" if is_selected else f"{peril_icon(peril)} {peril}"
+            if st.button(button_label, key=f"btn_{peril}", use_container_width=True):
+                if peril in st.session_state.selected_perils:
+                    st.session_state.selected_perils.remove(peril)
+                else:
+                    st.session_state.selected_perils.append(peril)
                 st.rerun()
     
-    # Alerts list below map with peril filter
+    # Alerts list below map
     st.subheader("Critical & Watch Alerts")
-    col1, col2 = st.columns([0.5, 0.5])
-    with col1:
-        st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
-    with col2:
-        # Define peril order for display
-        peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
-        available_perils = [p for p in peril_order if p in set(major["peril"].unique())] if not major.empty else []
-        
-        peril_filter = st.multiselect(
-            "Filter by peril",
-            options=available_perils,
-            default=available_perils,  # All selected by default
-            key="alert_peril_filter"
-        )
+    st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
     
-    # Show all events by default, filter only if user selected specific perils
-    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major
+    # Filter by selected perils, or show all if none selected
+    if st.session_state.selected_perils:
+        major_filtered = major[major["peril"].isin(st.session_state.selected_perils)]
+    else:
+        major_filtered = major
     
     if major_filtered.empty:
         st.caption("No Critical or Watch events.")
