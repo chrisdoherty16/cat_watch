@@ -1099,7 +1099,8 @@ def render_map(df, key, height=460, show_peril_toggle=True):
         return
 
     m["emoji"] = m["peril"].map(peril_icon)
-    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"]
+    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"] + "<br><em>Click to filter & jump to alert</em>"
+    m["peril_lower"] = m["peril"].str.lower().str.replace(" ", "_")
 
     fig = go.Figure()
     # One trace per tier -> clickable legend filters tiers. Colour halo = tier, emoji = peril.
@@ -1110,6 +1111,7 @@ def render_map(df, key, height=460, show_peril_toggle=True):
         fig.add_trace(go.Scattergeo(
             lat=sub["lat"], lon=sub["lon"], mode="markers+text",
             name=f"{tier} ({len(sub)})", legendrank=TIER_ORDER[tier],
+            customdata=sub[["peril", "event_id"]].values,
             marker=dict(size=TIER_SIZE.get(tier, 10) + 14, color=TIER_HEX.get(tier, "#8C96A0"),
                         opacity=0.32, line=dict(width=1.6, color=TIER_HEX.get(tier, "#8C96A0"))),
             text=sub["emoji"], textposition="middle center",
@@ -1467,32 +1469,32 @@ def app():
     render_map(filtered, key="major", height=560)
     
     # Quick peril filter buttons - multiselect mode
-    st.caption("Click perils to filter alerts (select multiple):")
+    st.caption("Click perils to show/hide (or click map icon for that event):")
     peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
     
     # Initialize session state for button selections
-    if "selected_perils" not in st.session_state:
-        st.session_state.selected_perils = []
+    if "filtered_perils" not in st.session_state:
+        st.session_state.filtered_perils = set()
     
     cols = st.columns(len(peril_order))
     for idx, peril in enumerate(peril_order):
         with cols[idx]:
-            is_selected = peril in st.session_state.selected_perils
+            is_selected = peril in st.session_state.filtered_perils
             button_label = f"✓ {peril_icon(peril)} {peril}" if is_selected else f"{peril_icon(peril)} {peril}"
             if st.button(button_label, key=f"btn_{peril}", use_container_width=True):
-                if peril in st.session_state.selected_perils:
-                    st.session_state.selected_perils.remove(peril)
+                if peril in st.session_state.filtered_perils:
+                    st.session_state.filtered_perils.discard(peril)
                 else:
-                    st.session_state.selected_perils.append(peril)
+                    st.session_state.filtered_perils.add(peril)
                 st.rerun()
     
     # Alerts list below map
     st.subheader("Critical & Watch Alerts")
     st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
     
-    # Filter by selected perils, or show all if none selected
-    if st.session_state.selected_perils:
-        major_filtered = major[major["peril"].isin(st.session_state.selected_perils)]
+    # Filter: if perils selected, show only those; otherwise show all
+    if st.session_state.filtered_perils:
+        major_filtered = major[major["peril"].isin(st.session_state.filtered_perils)]
     else:
         major_filtered = major
     
