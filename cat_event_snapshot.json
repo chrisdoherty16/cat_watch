@@ -1,0 +1,154 @@
+{
+  "GDACS|red earthquake (magnitude 7.4m, depth:110.285km) in colombia 10/08/2026 12:34 utc, 5.2 million (in mmi>=vii).": {
+    "magnitude": 7.4
+  },
+  "CALFIRE|bug fire": {
+    "acres": 66505.0,
+    "contained_pct": 0.0
+  },
+  "GDACS|orange flood alert in china": {},
+  "GDACS|drought is on going in democratic republic of congo, kenya, tanzania, uganda": {},
+  "CYCLONE|dolphin|nw pacific": {
+    "wind_kmh": 120.0
+  },
+  "GDACS|drought is on going in ethiopia, kenya, somalia": {},
+  "GDACS|drought is on going in madagascar": {},
+  "GDACS|drought is on going in albania, austria, bosnia & herzegovina, belgium, bulgaria, belarus, switzerland, czech republic, germany, denmark, spain, france, croatia, hungary, italy, liechtenstein, luxembourg, monaco, montenegro, the republic of north macedonia, poland, romania, serbia, sweden, slovenia, slovakia, san marino, ukraine, ,": {},
+  "CYCLONE|nangka|nw pacific": {
+    "wind_kmh": 120.0
+  },
+  "GDACS|green earthquake (magnitude 6m, depth:10km) in south sandwich islands region 12/08/2026 11:47 utc, [unknown].": {
+    "magnitude": 6.0
+  },
+  "GDACS|green flood alert in australia": {},
+  "GDACS|green flood alert in france": {},
+  "GDACS|green flood alert in morocco": {},
+  "CYCLONE|fifteen|nw pacific": {
+    "wind_kmh": 120.0
+  },
+  "GDACS|green flood alert in spain": {},
+  "CYCLONE|chan|nw pacific": {
+    "wind_kmh": 120.0
+  },
+  "CYCLONE|peilou|nw pacific": {
+    "wind_kmh": 120.0
+  },
+  "GDACS|green flood alert in peru": {},
+  "GDACS|green flood alert in thailand": {},
+  "GDACS|green flood alert in poland": {},
+  "GDACS|green flood alert in mexico": {},
+  "GDACS|green flood alert in austria": {},
+  "GDACS|green flood alert in italy": {},
+  "GDACS|green flood alert in vietnam": {},
+  "GDACS|green flood alert in myanmar": {},
+  "GDACS|green flood alert in india": {},
+  "GDACS|green flood alert in united states": {},
+  "CALFIRE|ridge fire": {
+    "acres": 1134.0,
+    "contained_pct": 100.0
+  },
+  "CYCLONE|one|": {
+    "wind_kmh": 55.0
+  },
+  "CALFIRE|mp18 fire": {
+    "acres": 2803.0,
+    "contained_pct": 10.0
+  },
+  "CALFIRE|timber fire": {
+    "acres": 3150.0,
+    "contained_pct": 5.0
+  },
+  "CALFIRE|gann fire": {
+    "acres": 10339.0,
+    "contained_pct": 96.0
+  },
+  "GDACS|green earthquake (magnitude 5.5m, depth:10km) in east central pacific ocean 10/08/2026 05:41 utc, [unknown].": {
+    "magnitude": 5.5
+  },
+  "GDACS|green earthquake (magnitude 5.6m, depth:34km) in japan 08/08/2026 17:58 utc, 310 thousand in mmi iv.": {
+    "magnitude": 5.6
+  },
+  "GDACS|green earthquake (magnitude 5.6m, depth:10km) in southeast of easter island 08/08/2026 11:41 utc, [unknown].": {
+    "magnitude": 5.6
+  },
+  "GDACS|green earthquake (magnitude 5.6m, depth:10km) in united states 08/08/2026 04:50 utc, 2 thousand in mmi>=iv.": {
+    "magnitude": 5.6
+  },
+  "CALFIRE|jarvis fire": {
+    "acres": 362.0,
+    "contained_pct": 100.0
+  },
+  "CYCLONE|cristobal|": {},
+  "NHC_OUTLOOK|AL92-AL93": {
+    "formation_chance": 80.0
+  },
+  "CALFIRE|hatchet fire": {
+    "acres": 606.0,
+    "contained_pct": 80.0
+  },
+  "NHC_OUTLOOK|CP93-EP99": {
+    "formation_chance": 90.0
+  },
+  "CALFIRE|foster fire": {
+    "acres": 252.0,
+    "contained_pct": 35.0
+  },
+  "CALFIRE|holser fire": {
+    "acres": 167.0,
+    "contained_pct": 95.0
+  },
+  "CALFIRE|buzzard fire": {
+    "acres": 902.0,
+    "contained_pct": 98.0
+  },
+  "GDACS|green forest fire notification in brazil": {},
+  "GDACS|green forest fire notification in australia": {},
+  "GDACS|green forest fire notification in mozambique": {},
+  "GDACS|green forest fire notification in angola": {},
+  "GDACS|green forest fire notification in kazakhstan": {},
+  "GDACS|green forest fire notification in russian federation": {},
+  "GDACS|green forest fire notification in zambia": {},
+  "GDACS|green forest fire notification in the democratic republic of congo, angola": {},
+  "GDACS|green forest fire notification in indonesia": {},
+  "GDACS|green forest fire notification in the democratic republic of congo": {},
+  "GDACS|green forest fire notification in tanzania": {},
+  "GDACS|green forest fire notification in united states": {},
+  "GDACS|green forest fire notification in spain": {},
+  "GDACS|green forest fire notification in zambia, the democratic republic of congo": {},
+  "GDACS|green forest fire notification in namibia": {},
+  "GDACS|green forest fire notification in colombia": {},
+  "GDACS|green forest fire notification in botswana": {},
+  "GDACS|green forest fire notification in zimbabwe": {},
+  "GDACS|green forest fire notification in georgia": {},
+  "GDACS|green forest fire notification in italy": {},
+  "GDACS|green forest fire notification in serbia": {},
+  "GDACS|green forest fire notification in canada": {},
+  "GDACS|green forest fire notification in angola, the democratic republic of congo": {},
+  "GDACS|green forest fire notification in bolivia": {},
+  "GDACS|drought is on going in china, kazakhstan, mongolia, russia": {},
+  "GDACS|volcanic eruption is on going for etna in italy": {},
+  "GDACS|drought is on going in belize, costa rica, guatemala, honduras, mexico, nicaragua, panama, el salvador": {},
+  "GDACS|drought is on going in colombia, , ecuador, panama, venezuela": {},
+  "GDACS|drought is on going in brazil": {},
+  "GDACS|drought is on going in australia, indonesia, cambodia, laos, papua new guinea, philippines, solomon is., thailand, vietnam": {},
+  "GDACS|drought is on going in canada, united states": {},
+  "GDACS|drought is on going in republic of congo, gabon": {},
+  "GDACS|drought is on going in united states": {},
+  "NHC|there are no tropical cyclones at this time.": {},
+  "CALFIRE|hawk fire": {
+    "acres": 45.0,
+    "contained_pct": 80.0
+  },
+  "CALFIRE|dennis fire": {
+    "acres": 16.2
+  },
+  "CALFIRE|flat fire": {
+    "acres": 20.0,
+    "contained_pct": 85.0
+  },
+  "CALFIRE|buffalo fire": {
+    "acres": 14.4,
+    "contained_pct": 70.0
+  },
+  "NHC|untitled": {}
+}

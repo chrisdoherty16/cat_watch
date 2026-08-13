@@ -1,0 +1,8 @@
+streamlit
+feedparser
+pandas
+requests
+python-dateutil
+beautifulsoup4
+streamlit-autorefresh
+plotly
