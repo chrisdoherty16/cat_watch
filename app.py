@@ -1058,11 +1058,11 @@ def peril_icon(peril):
 def _base_geo(fig, height, center=None, show_legend=False):
     fig.update_geos(
         projection_type="natural earth",
-        showland=True, landcolor="#1A1F2B",
-        showocean=True, oceancolor="#0E1117",
-        showcountries=True, countrycolor="#39414F",
-        showcoastlines=True, coastlinecolor="#39414F",
-        lakecolor="#0E1117", bgcolor="rgba(0,0,0,0)",
+        showland=True, landcolor="#D3A574",
+        showocean=True, oceancolor="#5BA3D0",
+        showcountries=True, countrycolor="#2C3E50",
+        showcoastlines=True, coastlinecolor="#2C3E50",
+        lakecolor="#5BA3D0", bgcolor="rgba(0,0,0,0)",
         center=center,
     )
     fig.update_layout(
@@ -1466,18 +1466,30 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
-    # Alerts list below map
+    # Alerts list below map with peril filter
     st.subheader("Critical & Watch Alerts")
-    if major.empty:
-        st.caption("No Critical or Watch events currently.")
-    else:
+    col1, col2 = st.columns([0.7, 0.3])
+    with col1:
         st.caption(f"Showing {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
-        render_cards(major, news_sources, new_ids, ns="major")
+    with col2:
+        peril_filter = st.multiselect(
+            "Filter by peril",
+            options=sorted(major["peril"].unique()) if not major.empty else [],
+            default=sorted(major["peril"].unique()) if not major.empty else [],
+            key="alert_peril_filter"
+        )
+    
+    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major
+    
+    if major_filtered.empty:
+        st.caption("No Critical or Watch events matching selected perils.")
+    else:
+        render_cards(major_filtered, news_sources, new_ids, ns="major")
 
     st.divider()
 
     tabs = st.tabs(["Tropical Cyclones", "Earthquakes", "Floods",
-                    "Wildfires", "Other Perils", "All Events", "Digest", "News Search"])
+                    "Wildfires", "Other Perils"])
 
     with tabs[0]:
         st.subheader("Tropical Cyclones")
@@ -1510,23 +1522,6 @@ def app():
         render_map(other, key="other", height=360)
         st.divider()
         render_cards(other, news_sources, new_ids, ns="other", compact=True)
-    with tabs[5]:
-        st.subheader("All Events")
-        render_table(filtered, new_ids)
-    with tabs[6]:
-        render_digest(filtered, new_ids)
-    with tabs[7]:
-        st.subheader("News Search")
-        st.caption("Free-text search across global news (Google News). Use the sidebar to restrict to specific outlets.")
-        q = st.text_input("Search topic", value="reinsurance catastrophe loss")
-        if q:
-            for it in fetch_news(q, tuple(news_sources)):
-                meta = " \u00B7 ".join(x for x in [it.get("source", ""), it.get("age", "")] if x)
-                st.markdown(
-                    f"- [{it['title']}]({it['link']})  \n"
-                    f"<span style='color:#8A94A6;font-size:0.8em'>{meta}</span>",
-                    unsafe_allow_html=True,
-                )
 
 
 if __name__ == "__main__":
