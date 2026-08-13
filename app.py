@@ -1399,6 +1399,10 @@ def app():
     st.set_page_config(page_title=APP_TITLE, page_icon="\U0001F310", layout="wide")
     st.title("\U0001F310 Global Cat Watch")
     st.caption("GDACS + NHC + CAL FIRE catastrophe monitor with maps, news lookup and desktop alerts.")
+    
+    # Clear peril filter on page load
+    if "selected_peril_filter" not in st.session_state:
+        st.session_state.selected_peril_filter = None
 
     with st.sidebar:
         st.header("Controls")
@@ -1471,10 +1475,6 @@ def app():
     # Quick peril filter buttons - single select mode
     st.caption("Click a peril to filter alerts to that type only:")
     peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
-    
-    # Initialize session state for button selection
-    if "selected_peril_filter" not in st.session_state:
-        st.session_state.selected_peril_filter = None
     
     cols = st.columns(len(peril_order))
     for idx, peril in enumerate(peril_order):
