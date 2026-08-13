@@ -1058,11 +1058,11 @@ def peril_icon(peril):
 def _base_geo(fig, height, center=None, show_legend=False):
     fig.update_geos(
         projection_type="natural earth",
-        showland=True, landcolor="#2D5016",
-        showocean=True, oceancolor="#1A3A52",
-        showcountries=True, countrycolor="#4A6741",
-        showcoastlines=True, coastlinecolor="#5A7A51",
-        lakecolor="#1A3A52", bgcolor="rgba(0,0,0,0)",
+        showland=True, landcolor="#3D5C39",
+        showocean=True, oceancolor="#1E3A5F",
+        showcountries=True, countrycolor="#4A6E3F",
+        showcoastlines=True, coastlinecolor="#6B8E5C",
+        lakecolor="#2A4A7C", bgcolor="rgba(0,0,0,0)",
         center=center,
     )
     fig.update_layout(
@@ -1466,24 +1466,38 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
+    # Quick peril filter buttons (simulates clicking on map)
+    st.caption("Or click a peril to filter alerts:")
+    peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
+    cols = st.columns(len(peril_order))
+    for idx, peril in enumerate(peril_order):
+        with cols[idx]:
+            if st.button(f"{peril_icon(peril)} {peril}", key=f"btn_{peril}", use_container_width=True):
+                st.session_state.alert_peril_filter = [peril]
+                st.rerun()
+    
     # Alerts list below map with peril filter
     st.subheader("Critical & Watch Alerts")
-    col1, col2 = st.columns([0.7, 0.3])
+    col1, col2 = st.columns([0.5, 0.5])
     with col1:
         st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
     with col2:
+        # Define peril order for display
+        peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
+        available_perils = [p for p in peril_order if p in set(major["peril"].unique())] if not major.empty else []
+        
         peril_filter = st.multiselect(
             "Filter by peril",
-            options=sorted(major["peril"].unique()) if not major.empty else [],
-            default=[],
-            placeholder="Select perils to display",
+            options=available_perils,
+            default=available_perils,  # All selected by default
             key="alert_peril_filter"
         )
     
-    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major.iloc[0:0]
+    # Show all events by default, filter only if user selected specific perils
+    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major
     
     if major_filtered.empty:
-        st.caption("No Critical or Watch events matching selected perils.")
+        st.caption("No Critical or Watch events.")
     else:
         render_cards(major_filtered, news_sources, new_ids, ns="major")
 
