@@ -1058,11 +1058,11 @@ def peril_icon(peril):
 def _base_geo(fig, height, center=None, show_legend=False):
     fig.update_geos(
         projection_type="natural earth",
-        showland=True, landcolor="#D3A574",
-        showocean=True, oceancolor="#5BA3D0",
-        showcountries=True, countrycolor="#2C3E50",
-        showcoastlines=True, coastlinecolor="#2C3E50",
-        lakecolor="#5BA3D0", bgcolor="rgba(0,0,0,0)",
+        showland=True, landcolor="#2D5016",
+        showocean=True, oceancolor="#1A3A52",
+        showcountries=True, countrycolor="#4A6741",
+        showcoastlines=True, coastlinecolor="#5A7A51",
+        lakecolor="#1A3A52", bgcolor="rgba(0,0,0,0)",
         center=center,
     )
     fig.update_layout(
@@ -1470,16 +1470,17 @@ def app():
     st.subheader("Critical & Watch Alerts")
     col1, col2 = st.columns([0.7, 0.3])
     with col1:
-        st.caption(f"Showing {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
+        st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
     with col2:
         peril_filter = st.multiselect(
             "Filter by peril",
             options=sorted(major["peril"].unique()) if not major.empty else [],
-            default=sorted(major["peril"].unique()) if not major.empty else [],
+            default=[],
+            placeholder="Select perils to display",
             key="alert_peril_filter"
         )
     
-    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major
+    major_filtered = major[major["peril"].isin(peril_filter)] if peril_filter else major.iloc[0:0]
     
     if major_filtered.empty:
         st.caption("No Critical or Watch events matching selected perils.")
@@ -1494,34 +1495,39 @@ def app():
     with tabs[0]:
         st.subheader("Tropical Cyclones")
         tc = filtered[filtered["peril"] == "Tropical Cyclone"]
-        render_map(tc, key="tc", height=360, show_peril_toggle=False)
-        st.divider()
-        render_cards(tc, news_sources, new_ids, ns="tc")
+        if tc.empty:
+            st.caption("No tropical cyclone events currently.")
+        else:
+            render_cards(tc, news_sources, new_ids, ns="tc")
     with tabs[1]:
         st.subheader("Earthquakes")
         eq = filtered[filtered["peril"] == "Earthquake"]
-        render_map(eq, key="eq", height=360, show_peril_toggle=False)
-        st.divider()
-        render_cards(eq, news_sources, new_ids, ns="eq")
+        if eq.empty:
+            st.caption("No earthquake events currently.")
+        else:
+            render_cards(eq, news_sources, new_ids, ns="eq")
     with tabs[2]:
         st.subheader("Floods")
         fl = filtered[filtered["peril"] == "Flood"]
-        render_map(fl, key="fl", height=360, show_peril_toggle=False)
-        st.divider()
-        render_cards(fl, news_sources, new_ids, ns="fl")
+        if fl.empty:
+            st.caption("No flood events currently.")
+        else:
+            render_cards(fl, news_sources, new_ids, ns="fl")
     with tabs[3]:
         st.subheader("Wildfires")
         st.caption("Global wildfires from GDACS (e.g. Europe) plus California incidents from CAL FIRE.")
         wf = filtered[filtered["peril"] == "Wildfire"]
-        render_map(wf, key="wf", height=360, show_peril_toggle=False)
-        st.divider()
-        render_cards(wf, news_sources, new_ids, ns="wf")
+        if wf.empty:
+            st.caption("No wildfire events currently.")
+        else:
+            render_cards(wf, news_sources, new_ids, ns="wf")
     with tabs[4]:
         st.subheader("Volcano / Drought / Other")
         other = filtered[filtered["peril"].isin(["Volcano", "Drought", "Other"])]
-        render_map(other, key="other", height=360)
-        st.divider()
-        render_cards(other, news_sources, new_ids, ns="other", compact=True)
+        if other.empty:
+            st.caption("No other peril events currently.")
+        else:
+            render_cards(other, news_sources, new_ids, ns="other", compact=True)
 
 
 if __name__ == "__main__":
