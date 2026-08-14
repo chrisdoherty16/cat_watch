@@ -1678,6 +1678,110 @@ def peril_icon(peril):
             "Volcano": "\U0001F30B", "Drought": "\u2600\uFE0F", "Other": "\U0001F4CC"}.get(peril, "\U0001F4CC")
 
 
+def inject_app_theme():
+    """Apply a restrained catastrophe-operations visual system."""
+    st.markdown("""
+    <style>
+    :root {
+      --gcw-bg: #07111f;
+      --gcw-panel: #0d1a2a;
+      --gcw-panel-2: #112238;
+      --gcw-border: rgba(148, 163, 184, 0.20);
+      --gcw-text: #eef4fb;
+      --gcw-muted: #91a4ba;
+      --gcw-cyan: #38bdf8;
+    }
+    .stApp {
+      background:
+        radial-gradient(circle at 82% -8%, rgba(14,165,233,.10), transparent 30rem),
+        linear-gradient(180deg, #07111f 0%, #08131f 100%);
+      color: var(--gcw-text);
+    }
+    [data-testid="stHeader"] { background: rgba(7,17,31,.78); backdrop-filter: blur(12px); }
+    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0a1626, #07111f); border-right: 1px solid var(--gcw-border); }
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { letter-spacing: .01em; }
+    .block-container { max-width: 1680px; padding-top: 1.15rem; padding-bottom: 3rem; }
+    .gcw-hero {
+      display:flex; justify-content:space-between; align-items:flex-end; gap:1.25rem;
+      padding:1.25rem 1.45rem; margin:0 0 1rem 0;
+      border:1px solid rgba(56,189,248,.18); border-radius:18px;
+      background:linear-gradient(120deg, rgba(17,34,56,.96), rgba(8,22,38,.96));
+      box-shadow:0 18px 45px rgba(0,0,0,.24), inset 0 1px 0 rgba(255,255,255,.035);
+    }
+    .gcw-kicker { color:#38bdf8; font-size:.72rem; font-weight:800; letter-spacing:.16em; text-transform:uppercase; margin-bottom:.3rem; }
+    .gcw-title { color:#f8fbff; font-size:2rem; line-height:1.05; font-weight:800; letter-spacing:-.035em; }
+    .gcw-subtitle { color:#91a4ba; font-size:.9rem; margin-top:.45rem; }
+    .gcw-stats { display:flex; gap:.55rem; flex-wrap:wrap; justify-content:flex-end; }
+    .gcw-stat { min-width:92px; padding:.58rem .72rem; border:1px solid var(--gcw-border); border-radius:11px; background:rgba(5,15,27,.46); }
+    .gcw-stat-label { color:#8296ae; font-size:.65rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    .gcw-stat-value { color:#f5f9ff; font-size:1.05rem; font-weight:750; margin-top:.08rem; }
+    .gcw-map-legend {
+      display:flex; align-items:center; flex-wrap:wrap; gap:.6rem 1rem;
+      margin:.15rem 0 .65rem 0; padding:.72rem .9rem;
+      border:1px solid var(--gcw-border); border-radius:12px; background:rgba(13,26,42,.72);
+      color:#b9c8d8; font-size:.78rem;
+    }
+    .gcw-map-legend strong { color:#edf5ff; font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; }
+    .gcw-dot { width:9px; height:9px; border-radius:999px; display:inline-block; margin-right:.28rem; box-shadow:0 0 8px currentColor; }
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+      border-color:var(--gcw-border) !important; border-radius:15px !important;
+      background:linear-gradient(145deg, rgba(13,26,42,.88), rgba(8,20,34,.88));
+      box-shadow:0 10px 28px rgba(0,0,0,.16);
+    }
+    div[data-testid="stMetric"] { padding:.15rem .15rem .35rem .15rem; }
+    div[data-testid="stMetricLabel"] { color:#8fa3ba; }
+    div[data-testid="stMetricValue"] { letter-spacing:-.025em; }
+    button[data-baseweb="tab"] { font-weight:650; color:#8fa3ba; padding-top:.72rem; padding-bottom:.72rem; }
+    button[data-baseweb="tab"][aria-selected="true"] { color:#eaf6ff; }
+    [data-testid="stExpander"] { border-color:rgba(148,163,184,.18) !important; background:rgba(5,15,27,.30); border-radius:10px; }
+    [data-testid="stLinkButton"] a, .stButton button { border-radius:10px; }
+    hr { border-color:rgba(148,163,184,.16) !important; }
+    @media (max-width: 900px) {
+      .gcw-hero { align-items:flex-start; flex-direction:column; }
+      .gcw-stats { justify-content:flex-start; }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def render_app_header(filtered=None, new_visible=0):
+    filtered = filtered if filtered is not None else pd.DataFrame()
+    critical = int((filtered.get("tier") == "Critical").sum()) if not filtered.empty else 0
+    watch = int((filtered.get("tier") == "Watch").sum()) if not filtered.empty else 0
+    refresh_time = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    st.markdown(f"""
+    <div class="gcw-hero">
+      <div>
+        <div class="gcw-kicker">Live catastrophe intelligence</div>
+        <div class="gcw-title">Global Cat Watch</div>
+        <div class="gcw-subtitle">GDACS, NHC and CAL FIRE monitoring with persistent event histories</div>
+      </div>
+      <div class="gcw-stats">
+        <div class="gcw-stat"><div class="gcw-stat-label">Critical</div><div class="gcw-stat-value">{critical}</div></div>
+        <div class="gcw-stat"><div class="gcw-stat-label">Watch</div><div class="gcw-stat-value">{watch}</div></div>
+        <div class="gcw-stat"><div class="gcw-stat-label">New</div><div class="gcw-stat-value">{new_visible}</div></div>
+        <div class="gcw-stat"><div class="gcw-stat-label">Refreshed</div><div class="gcw-stat-value">{refresh_time}</div></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_map_legend(perils):
+    peril_bits = "".join(
+        f'<span>{peril_icon(peril)} {peril}</span>' for peril in PERIL_ORDER if peril in perils
+    )
+    st.markdown(f"""
+    <div class="gcw-map-legend">
+      <strong>Severity</strong>
+      <span><i class="gcw-dot" style="background:#DC322F;color:#DC322F"></i>Critical</span>
+      <span><i class="gcw-dot" style="background:#F08C14;color:#F08C14"></i>Watch</span>
+      <span><i class="gcw-dot" style="background:#E6C828;color:#E6C828"></i>Advisory</span>
+      <span><i class="gcw-dot" style="background:#8C96A0;color:#8C96A0"></i>Info</span>
+      <strong>Peril</strong>{peril_bits}
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def _base_geo(fig, height, center=None, show_legend=False):
     fig.update_geos(
         projection_type="natural earth",
@@ -1722,7 +1826,22 @@ def render_map(df, key, height=460, show_peril_toggle=True):
         return
 
     m["emoji"] = m["peril"].map(peril_icon)
-    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"] + "<br><em>Click to filter & jump to alert</em>"
+    def map_hover(row):
+        bits = [str(row.get("title", "")), f"{row.get('tier', '')} · {row.get('peril', '')} · {row.get('source', '')}"]
+        metrics = []
+        if pd.notna(row.get("wind_kmh")):
+            metrics.append(f"Wind {row['wind_kmh']:.0f} km/h")
+        if pd.notna(row.get("pressure_mb")):
+            metrics.append(f"Pressure {row['pressure_mb']:.0f} mb")
+        if pd.notna(row.get("magnitude")):
+            metrics.append(f"Magnitude M{row['magnitude']:g}")
+        if pd.notna(row.get("acres")):
+            metrics.append(f"{row['acres']:,.0f} acres")
+        if metrics:
+            bits.append(" · ".join(metrics))
+        bits.append(f"Updated {row.get('age', 'Unknown')}")
+        return "<br>".join(bits)
+    m["hover"] = m.apply(map_hover, axis=1)
     m["peril_lower"] = m["peril"].str.lower().str.replace(" ", "_")
 
     fig = go.Figure()
@@ -1741,12 +1860,14 @@ def render_map(df, key, height=460, show_peril_toggle=True):
             textfont=dict(size=TIER_SIZE.get(tier, 10) + 3),
             hovertext=sub["hover"], hoverinfo="text",
         ))
-    _base_geo(fig, height, show_legend=True)
+    render_map_legend(set(m["peril"]))
+    _base_geo(fig, height, show_legend=False)
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        geo=dict(framecolor="rgba(148,163,184,.18)", framewidth=1),
+    )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"{key}_map")
-
-    peril_legend = "  ".join(f"{peril_icon(p)} {p}" for p in PERIL_ORDER if p in set(m["peril"]))
-    st.caption(f"Click a tier in the legend to show/hide it (double-click to isolate).  \u00B7  Icon = peril: {peril_legend}  \u00B7  {len(m)} mapped")
-
+    st.caption(f"{len(m)} events mapped · Marker colour = severity · Symbol = peril")
 
 def render_locator(row, key, height=240):
     lat, lon = to_float(row.get("lat")), to_float(row.get("lon"))
@@ -2025,7 +2146,9 @@ def app():
     
 
     with st.sidebar:
-        st.header("Controls")
+        st.markdown("## CatWatch Controls")
+        st.caption("Live monitoring and display settings")
+        st.markdown("### Refresh")
         auto_refresh = st.toggle("Auto-refresh", value=True)
         refresh_minutes = st.number_input("Refresh interval, minutes", 5, 60, DEFAULT_REFRESH_MINUTES, 5)
         auto_count = 0
@@ -2039,10 +2162,12 @@ def app():
             st.rerun()
 
         st.divider()
+        st.markdown("### Notifications")
         desktop_alerts = st.toggle("Desktop alerts", value=False)
         alert_material = st.checkbox("Material status and metric changes", value=True, disabled=not desktop_alerts)
         alert_major = st.checkbox("New Critical/Watch events", value=True, disabled=not desktop_alerts)
         st.divider()
+        st.markdown("### View filters")
         time_window = st.selectbox("Time window", ["24 hours", "7 days", "30 days", "All available"], index=1)
         hours_lookup = {"24 hours": 24, "7 days": 168, "30 days": 720, "All available": None}
         min_tier = st.selectbox("Minimum tier", ["Critical", "Watch", "Advisory", "Info"], index=2)
@@ -2085,6 +2210,8 @@ def app():
     new_ids = update_new_ids(set(df["event_id"]), refresh_token)
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
     new_visible = len(set(filtered["event_id"]) & new_ids) if not filtered.empty else 0
+
+    render_app_header(filtered, new_visible)
 
     major = filtered[filtered["tier"].isin(["Critical", "Watch"])].copy()
     major["_major_tier_rank"] = major["tier"].map({"Critical": 0, "Watch": 1}).fillna(9)
