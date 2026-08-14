@@ -1099,7 +1099,18 @@ NON_CHANGE_FIELDS = {"first_observed", "initial_state", "source_text"}
 
 
 def genuine_timeline_changes(changes):
-    return [item for item in changes if item.get("field_name") not in NON_CHANGE_FIELDS]
+    """Exclude the entire baseline observation, including legacy baseline fields."""
+    baseline_observation_ids = {
+        item.get("observation_id")
+        for item in changes
+        if item.get("field_name") in {"first_observed", "initial_state"}
+        and item.get("observation_id") is not None
+    }
+    return [
+        item for item in changes
+        if item.get("field_name") not in NON_CHANGE_FIELDS
+        and item.get("observation_id") not in baseline_observation_ids
+    ]
 
 
 def timeline_update_count(changes):
@@ -1890,21 +1901,18 @@ def render_cards(df, news_sources, new_ids, ns="", limit=50, compact=False):
         return
 
     display_df = df.copy()
-    if ns == "major":
-        # Enforce the operational order immediately before rendering. This avoids
-        # inherited dataframe indexes or earlier alert-level sorting changing it.
-        display_df["_major_tier_rank"] = display_df["tier"].map(
-            {"Critical": 0, "Watch": 1}
-        ).fillna(9)
-        display_df["_major_updated"] = pd.to_datetime(
-            display_df["published_utc"], errors="coerce", utc=True
-        )
-        display_df = display_df.sort_values(
-            ["_major_tier_rank", "_major_updated"],
-            ascending=[True, False],
-            na_position="last",
-            kind="stable",
-        )
+    # Apply the intended operational order in every event tab:
+    # Critical, Watch, Advisory, Info; newest source update first within tier.
+    display_df["_display_tier_rank"] = display_df["tier"].map(TIER_ORDER).fillna(9)
+    display_df["_display_updated"] = pd.to_datetime(
+        display_df["published_utc"], errors="coerce", utc=True
+    )
+    display_df = display_df.sort_values(
+        ["_display_tier_rank", "_display_updated"],
+        ascending=[True, False],
+        na_position="last",
+        kind="stable",
+    )
 
     for _, row in display_df.head(limit).iterrows():
         render_event_card(row, news_sources, new_ids, ns=ns, compact=compact)
