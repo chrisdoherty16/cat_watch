@@ -270,16 +270,39 @@ def build_tc_title(raw_title, summary="", status="", wind=None):
     return f"{head} - {tail}" if tail else head
 
 
+def clean_optional_text(value):
+    """Return blank for missing values, including pandas NaN/NaT."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "nat"} else text
+
+
 def nhc_active_storm_key(row):
     if row.get("source") != "NHC" or row.get("peril") != "Tropical Cyclone":
         return ""
-    if is_outlook(row.get("raw_title", ""), row.get("summary", "")):
+    raw_title = clean_optional_text(row.get("raw_title"))
+    summary = clean_optional_text(row.get("summary"))
+    if is_outlook(raw_title, summary):
         return ""
-    if row.get("atcf_id"):
-        return f"ATCF|{row.get('atcf_id')}"
-    ident = extract_tc_identity(row.get("raw_title", ""), row.get("summary", ""))
-    basin = extract_basin(row.get("raw_title", ""), row.get("summary", "")) or outlook_basin(row.get("summary", ""))
-    return f"NHC|{basin.lower()}|{ident.lower()}" if ident else ""
+
+    # Use the normalized storm name first because different NHC products for the
+    # same named storm do not always expose the same ATCF identifier.
+    ident = extract_tc_identity(raw_title, summary)
+    if ident and not re.fullmatch(r"[A-Z]{2}\d{4,6}", ident, flags=re.IGNORECASE):
+        return f"NHC|NAME|{ident.casefold()}"
+
+    atcf_id = clean_optional_text(row.get("atcf_id"))
+    if atcf_id:
+        return f"ATCF|{atcf_id.upper()}"
+
+    basin = extract_basin(raw_title, summary) or outlook_basin(summary)
+    return f"NHC|{basin.casefold()}|{ident.casefold()}" if ident else ""
 
 def extract_atcf_id(text):
     """Extract an ATCF identifier such as AL032026 from text or a URL."""
@@ -1212,8 +1235,10 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
                 product_count = int(row.get("source_product_count") or 0)
             except Exception:
                 product_count = 0
-            if product_count > 1:
-                st.caption(f"Collapsed {product_count} NHC products into one storm card: {row.get('source_products', '')}")
+            source_products = clean_optional_text(row.get("source_products"))
+            if row.get("source") == "NHC" and product_count > 1:
+                detail = f": {source_products}" if source_products else ""
+                st.caption(f"Collapsed {product_count} NHC products into one storm card{detail}")
             if row.get("summary"):
                 text = display_summary(row["summary"])
                 if compact:
@@ -1253,8 +1278,9 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
                 st.caption(f"Magnitude: {row['magnitude']}")
             if row.get("status"):
                 st.caption(f"Status: {row['status']}")
-            if row.get("product_type"):
-                st.caption(f"NHC product: {row['product_type']}")
+            product_type = clean_optional_text(row.get("product_type"))
+            if row.get("source") == "NHC" and product_type:
+                st.caption(f"NHC product: {product_type}")
             if pd.notna(row.get("wind_kmh")):
                 st.caption(f"Wind: {row['wind_kmh']:.0f} km/h")
             if pd.notna(row.get("pressure_mb")):
