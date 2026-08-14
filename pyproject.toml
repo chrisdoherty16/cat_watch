@@ -17,5 +17,6 @@ dependencies = [
     "requests>=2.34.2",
     "streamlit>=1.36,<2.0",
     "streamlit-autorefresh>=1.0.1",
+    "supabase>=2.31.0",
     "yfinance>=0.2.40",
 ]
