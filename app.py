@@ -2,6 +2,7 @@ import re
 import json
 import os
 import sqlite3
+import hashlib
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 from html import unescape
@@ -796,6 +797,381 @@ def supabase_health_check():
         return False, f"Connection failed: {message}"
 
 
+HISTORY_FIELDS = [
+    "status", "forecast_status", "wind_kmh", "pressure_mb",
+    "formation_chance", "move_direction", "move_kmh", "lat", "lon",
+    "magnitude", "acres", "contained_pct", "alert_level", "tier",
+    "advisory_number", "raw_title", "summary",
+]
+
+HISTORY_LABELS = {
+    "status": "Status", "forecast_status": "Forecast", "wind_kmh": "Wind",
+    "pressure_mb": "Pressure", "formation_chance": "Formation chance",
+    "move_direction": "Movement direction", "move_kmh": "Movement speed",
+    "lat": "Latitude", "lon": "Longitude", "magnitude": "Magnitude",
+    "acres": "Area", "contained_pct": "Containment", "alert_level": "Alert",
+    "tier": "Tier", "advisory_number": "Advisory", "raw_title": "Source title",
+    "summary": "Source text",
+}
+
+
+def history_value(value):
+    """Convert pandas/numpy values into stable JSON-safe Python values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, float):
+        return round(value, 4)
+    return value
+
+
+def iso_utc(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    parsed = parse_dt(str(value))
+    return parsed.isoformat() if parsed else None
+
+
+def observation_state(row):
+    return {field: history_value(row.get(field)) for field in HISTORY_FIELDS}
+
+
+def observation_hash(state):
+    payload = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def format_history_value(field, value):
+    if value is None or value == "":
+        return "not stated"
+    try:
+        number = float(value)
+        if field == "wind_kmh":
+            return f"{number:.0f} km/h"
+        if field == "pressure_mb":
+            return f"{number:.0f} mb"
+        if field in {"formation_chance", "contained_pct"}:
+            return f"{number:.0f}%"
+        if field == "move_kmh":
+            return f"{number:.0f} km/h"
+        if field == "magnitude":
+            return f"M{number:g}"
+        if field == "acres":
+            return f"{number:,.0f} acres"
+        if field in {"lat", "lon"}:
+            return f"{number:.3f}"
+    except (TypeError, ValueError):
+        pass
+    if field == "forecast_status" and value:
+        return f"Expected to become {value}"
+    return str(value)
+
+
+def build_change_records(previous, current):
+    changes = []
+    for field in HISTORY_FIELDS:
+        old = previous.get(field) if previous else None
+        new = current.get(field)
+        if old == new:
+            continue
+        # Raw source updates are retained in the observation, but represented by
+        # one concise timeline item instead of dumping full text into the card.
+        if field in {"raw_title", "summary"}:
+            continue
+        label = HISTORY_LABELS[field]
+        if previous is None:
+            if new not in (None, ""):
+                changes.append((field, old, new, f"{label}: {format_history_value(field, new)}"))
+        else:
+            changes.append((
+                field, old, new,
+                f"{label}: {format_history_value(field, old)} → {format_history_value(field, new)}",
+            ))
+    if previous is not None:
+        raw_changed = any(previous.get(field) != current.get(field) for field in ("raw_title", "summary"))
+        if raw_changed and not changes:
+            changes.append(("source_text", None, None, "Source text updated"))
+    return changes
+
+
+def persist_event_history(df):
+    """Write only genuinely changed event states to Supabase."""
+    client = supabase_client()
+    if client is None or df.empty:
+        return df, "Persistent history unavailable."
+
+    out = df.copy()
+    row_changes = []
+    failures = []
+    detected_at = datetime.now(timezone.utc).isoformat()
+
+    for _, row in out.iterrows():
+        event_key = str(row.get("event_id") or tracking_key(row))
+        source_updated_at = iso_utc(row.get("published_utc"))
+        state = observation_state(row)
+        state_hash = observation_hash(state)
+        current_change_texts = []
+        try:
+            event_payload = {
+                "event_key": event_key,
+                "peril": clean_optional_text(row.get("peril")) or "Other",
+                "source": clean_optional_text(row.get("source")) or "Unknown",
+                "display_name": clean_optional_text(row.get("title")) or event_key,
+                "last_seen_at": detected_at,
+                "active": True,
+                "latest_source_url": clean_optional_text(row.get("link")) or None,
+                "updated_at": detected_at,
+            }
+            client.table("events").upsert(event_payload, on_conflict="event_key").execute()
+
+            prior_response = (
+                client.table("observations")
+                .select("*")
+                .eq("event_key", event_key)
+                .order("detected_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            prior = prior_response.data[0] if prior_response.data else None
+            if prior and prior.get("observation_hash") == state_hash:
+                row_changes.append([])
+                continue
+
+            observation_payload = {
+                "event_key": event_key,
+                "detected_at": detected_at,
+                "source_updated_at": source_updated_at,
+                "status": state.get("status"),
+                "forecast_status": state.get("forecast_status"),
+                "wind_kmh": state.get("wind_kmh"),
+                "pressure_mb": state.get("pressure_mb"),
+                "formation_chance": state.get("formation_chance"),
+                "movement_direction": state.get("move_direction"),
+                "movement_kmh": state.get("move_kmh"),
+                "latitude": state.get("lat"),
+                "longitude": state.get("lon"),
+                "magnitude": state.get("magnitude"),
+                "acres": state.get("acres"),
+                "contained_pct": state.get("contained_pct"),
+                "alert_level": state.get("alert_level"),
+                "tier": state.get("tier"),
+                "advisory_number": state.get("advisory_number"),
+                "raw_title": state.get("raw_title"),
+                "raw_summary": state.get("summary"),
+                "source_url": clean_optional_text(row.get("link")) or None,
+                "observation_hash": state_hash,
+            }
+            inserted = client.table("observations").insert(observation_payload).execute()
+            if not inserted.data:
+                raise RuntimeError("Observation insert returned no record")
+            observation_id = inserted.data[0]["observation_id"]
+
+            previous_state = None
+            if prior:
+                previous_state = {
+                    "status": prior.get("status"), "forecast_status": prior.get("forecast_status"),
+                    "wind_kmh": prior.get("wind_kmh"), "pressure_mb": prior.get("pressure_mb"),
+                    "formation_chance": prior.get("formation_chance"),
+                    "move_direction": prior.get("movement_direction"), "move_kmh": prior.get("movement_kmh"),
+                    "lat": prior.get("latitude"), "lon": prior.get("longitude"),
+                    "magnitude": prior.get("magnitude"), "acres": prior.get("acres"),
+                    "contained_pct": prior.get("contained_pct"), "alert_level": prior.get("alert_level"),
+                    "tier": prior.get("tier"), "advisory_number": prior.get("advisory_number"),
+                    "raw_title": prior.get("raw_title"), "summary": prior.get("raw_summary"),
+                }
+            changes = build_change_records(previous_state, state)
+            if previous_state is None:
+                changes.insert(0, ("first_observed", None, None, "First observed by CatWatch"))
+
+            change_payloads = []
+            for field, old, new, text in changes:
+                change_payloads.append({
+                    "event_key": event_key,
+                    "observation_id": observation_id,
+                    "detected_at": detected_at,
+                    "source_updated_at": source_updated_at,
+                    "field_name": field,
+                    "previous_value": None if old is None else str(old),
+                    "current_value": None if new is None else str(new),
+                    "change_text": text,
+                })
+            if change_payloads:
+                client.table("changes").insert(change_payloads).execute()
+            current_change_texts = [item[3] for item in changes]
+            row_changes.append(current_change_texts)
+        except Exception as exc:
+            failures.append(f"{event_key}: {str(exc)[:120]}")
+            row_changes.append([])
+
+    out["history_changes"] = row_changes
+    if failures:
+        return out, f"History saved with {len(failures)} error(s)."
+    changed_count = sum(bool(items) for items in row_changes)
+    return out, f"History current. {changed_count} event update(s) recorded."
+
+
+def get_event_timeline(event_key, limit=25):
+    client = supabase_client()
+    if client is None:
+        return []
+    try:
+        response = (
+            client.table("changes")
+            .select("change_id,observation_id,detected_at,source_updated_at,change_text,field_name")
+            .eq("event_key", event_key)
+            .order("source_updated_at", desc=True)
+            .order("detected_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def get_history_events():
+    client = supabase_client()
+    if client is None:
+        return []
+    try:
+        response = (
+            client.table("events")
+            .select("event_key,display_name,peril,source,first_seen_at,last_seen_at,active")
+            .order("last_seen_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def get_event_observations(event_key, limit=100):
+    client = supabase_client()
+    if client is None:
+        return []
+    try:
+        response = (
+            client.table("observations")
+            .select("*")
+            .eq("event_key", event_key)
+            .order("source_updated_at", desc=True)
+            .order("detected_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        return []
+
+
+def timeline_timestamp(item):
+    value = item.get("source_updated_at") or item.get("detected_at")
+    parsed = parse_dt(value)
+    return parsed.strftime("%d %b %Y · %H:%M UTC") if parsed else "Time unavailable"
+
+
+def render_event_timeline(event_key, compact=True):
+    changes = get_event_timeline(event_key, limit=20 if compact else 100)
+    if not changes:
+        st.caption("No recorded changes yet.")
+        return
+    grouped = {}
+    for item in changes:
+        observation_id = item.get("observation_id")
+        grouped.setdefault(observation_id, []).append(item)
+    for items in grouped.values():
+        st.markdown(f"**{timeline_timestamp(items[0])}**")
+        for item in items:
+            st.markdown(f"- {item.get('change_text', 'Update recorded')}")
+        detected = parse_dt(items[0].get("detected_at"))
+        source_time = parse_dt(items[0].get("source_updated_at"))
+        if detected and source_time and abs((detected - source_time).total_seconds()) >= 60:
+            st.caption(f"Detected by CatWatch: {detected.strftime('%d %b %Y · %H:%M UTC')}")
+
+
+def render_history_tab():
+    st.subheader("Event History")
+    st.caption("Persistent timelines containing actual source changes, not dashboard refreshes.")
+    events = get_history_events()
+    if not events:
+        st.info("No persistent event history has been recorded yet.")
+        return
+    events_df = pd.DataFrame(events)
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        peril_options = ["All"] + sorted(events_df["peril"].dropna().unique().tolist())
+        peril_filter = st.selectbox("Peril", peril_options, key="history_peril")
+    with c2:
+        source_options = ["All"] + sorted(events_df["source"].dropna().unique().tolist())
+        source_filter = st.selectbox("Source", source_options, key="history_source")
+    with c3:
+        search = st.text_input("Find event", placeholder="Storm, fire, earthquake...", key="history_search")
+    view = events_df.copy()
+    if peril_filter != "All":
+        view = view[view["peril"] == peril_filter]
+    if source_filter != "All":
+        view = view[view["source"] == source_filter]
+    if search:
+        view = view[view["display_name"].str.contains(search, case=False, na=False)]
+    if view.empty:
+        st.info("No events match the selected history filters.")
+        return
+    labels = {
+        row["event_key"]: f"{row['display_name']} · {row['source']}"
+        for _, row in view.iterrows()
+    }
+    event_key = st.selectbox("Event", list(labels), format_func=lambda key: labels[key], key="history_event")
+    selected = view[view["event_key"] == event_key].iloc[0]
+    st.markdown(f"### {selected['display_name']}")
+    st.caption(f"{selected['peril']} · {selected['source']} · Event key: {event_key}")
+    observations = get_event_observations(event_key)
+    if observations:
+        latest = observations[0]
+        metrics = []
+        for label, field in [("Status", "status"), ("Forecast", "forecast_status"), ("Wind", "wind_kmh"), ("Pressure", "pressure_mb"), ("Area", "acres"), ("Containment", "contained_pct")]:
+            value = latest.get(field)
+            if value not in (None, ""):
+                metrics.append((label, format_history_value(field, value)))
+        if metrics:
+            columns = st.columns(min(len(metrics), 4))
+            for index, (label, value) in enumerate(metrics):
+                columns[index % len(columns)].metric(label, value)
+    st.markdown("#### Timeline")
+    render_event_timeline(event_key, compact=False)
+    if observations:
+        with st.expander("Original source updates"):
+            for observation in observations:
+                stamp = observation.get("source_updated_at") or observation.get("detected_at")
+                st.markdown(f"**{timeline_timestamp({'source_updated_at': stamp})}**")
+                st.write(observation.get("raw_title") or "Untitled source update")
+                if observation.get("raw_summary"):
+                    st.caption(observation["raw_summary"])
+                if observation.get("source_url"):
+                    st.markdown(f"[Open source]({observation['source_url']})")
+                st.divider()
+
+
 def history_connection():
     conn = sqlite3.connect(HISTORY_DB)
     conn.execute("""CREATE TABLE IF NOT EXISTS observations (
@@ -1394,6 +1770,10 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
                     st.write(text[:800] + ("..." if len(text) > 800 else ""))
 
             has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
+            event_key = str(row.get("event_id") or tracking_key(row))
+            timeline = get_event_timeline(event_key, limit=20)
+            with st.expander(f"Change history ({len(timeline)})"):
+                render_event_timeline(event_key, compact=True)
             ncol, mcol = st.columns(2)
             with ncol:
                 with st.expander("\U0001F4F0 Related news"):
@@ -1609,16 +1989,22 @@ def app():
                 st.success(supabase_message)
             else:
                 st.warning(supabase_message)
-            st.caption("This check is read-only. Event history is not being written yet.")
+            st.caption("Persistent history records only changed event states.")
 
     refresh_token = f"{auto_count}:{st.session_state.get('refresh_clicks', 0)}"
 
     df = load_events()
+    history_write_status = ""
     if not df.empty:
         df = material_changes(df, refresh_token)
+        if supabase_health_check()[0]:
+            df, history_write_status = persist_event_history(df)
+
     if df.empty:
         st.error("No feed items loaded. Check connectivity or source availability.")
         return
+    if history_write_status and "error" in history_write_status.lower():
+        st.warning(history_write_status)
 
     new_ids = update_new_ids(set(df["event_id"]), refresh_token)
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
@@ -1659,6 +2045,7 @@ def app():
         "Earthquake",
         "Flood",
         "Other",
+        "Event History",
     ])
 
     tab_views = [
@@ -1675,20 +2062,24 @@ def app():
             "other",
             True,
         ),
+        ("Event History", None, "history", False),
     ]
 
     for tab, (label, view_df, namespace, compact) in zip(tabs, tab_views):
         with tab:
-            st.subheader(label)
-            if view_df.empty:
-                st.caption(f"No {label.lower()} events currently.")
+            if namespace == "history":
+                render_history_tab()
             else:
-                render_cards(
-                    view_df,
-                    news_sources,
-                    new_ids,
-                    ns=namespace,
-                    compact=compact,
-                )
+                st.subheader(label)
+                if view_df.empty:
+                    st.caption(f"No {label.lower()} events currently.")
+                else:
+                    render_cards(
+                        view_df,
+                        news_sources,
+                        new_ids,
+                        ns=namespace,
+                        compact=compact,
+                    )
 if __name__ == "__main__":
     app()
