@@ -887,32 +887,54 @@ def format_history_value(field, value):
     return str(value)
 
 
+def initial_state_text(current):
+    """Build a concise baseline summary while full values remain in observations."""
+    parts = []
+    for field in ("status", "magnitude", "wind_kmh", "pressure_mb", "formation_chance", "acres", "contained_pct"):
+        value = current.get(field)
+        if value not in (None, ""):
+            parts.append(format_history_value(field, value))
+    alert = current.get("alert_level")
+    if alert not in (None, "", "Unknown"):
+        parts.append(f"{alert} alert")
+    tier = current.get("tier")
+    if tier not in (None, ""):
+        parts.append(str(tier))
+    return " · ".join(parts[:6])
+
+
 def build_change_records(previous, current):
+    if previous is None:
+        baseline = initial_state_text(current)
+        changes = [("first_observed", None, None, "First observed by CatWatch")]
+        if baseline:
+            changes.append(("initial_state", None, None, f"Initial state: {baseline}"))
+        return changes
+
     changes = []
     for field in HISTORY_FIELDS:
-        old = previous.get(field) if previous else None
+        old = previous.get(field)
         new = current.get(field)
         if old == new:
             continue
-        # Raw source updates are retained in the observation, but represented by
-        # one concise timeline item instead of dumping full text into the card.
+        # Full source text and exact coordinates remain stored for audit. Source
+        # wording alone is a genuine observation update, but it is not a user
+        # notification unless another tracked event field also changed.
         if field in {"raw_title", "summary"}:
             continue
+        # Small coordinate movements create noise and are retained only in the
+        # underlying observation record.
+        if field in {"lat", "lon"}:
+            continue
         label = HISTORY_LABELS[field]
-        if previous is None:
-            if new not in (None, ""):
-                changes.append((field, old, new, f"{label}: {format_history_value(field, new)}"))
-        else:
-            changes.append((
-                field, old, new,
-                f"{label}: {format_history_value(field, old)} → {format_history_value(field, new)}",
-            ))
-    if previous is not None:
-        raw_changed = any(previous.get(field) != current.get(field) for field in ("raw_title", "summary"))
-        if raw_changed and not changes:
-            changes.append(("source_text", None, None, "Source text updated"))
+        changes.append((
+            field, old, new,
+            f"{label}: {format_history_value(field, old)} → {format_history_value(field, new)}",
+        ))
+    raw_changed = any(previous.get(field) != current.get(field) for field in ("raw_title", "summary"))
+    if raw_changed and not changes:
+        changes.append(("source_text", None, None, "Source text updated"))
     return changes
-
 
 def persist_event_history(df):
     """Write only genuinely changed event states to Supabase."""
@@ -981,8 +1003,33 @@ def persist_event_history(df):
                 "source_url": clean_optional_text(row.get("link")) or None,
                 "observation_hash": state_hash,
             }
-            inserted = client.table("observations").insert(observation_payload).execute()
+            try:
+                inserted = client.table("observations").insert(observation_payload).execute()
+            except Exception:
+                existing = (
+                    client.table("observations")
+                    .select("observation_id")
+                    .eq("event_key", event_key)
+                    .eq("observation_hash", state_hash)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    row_changes.append([])
+                    continue
+                raise
             if not inserted.data:
+                existing = (
+                    client.table("observations")
+                    .select("observation_id")
+                    .eq("event_key", event_key)
+                    .eq("observation_hash", state_hash)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data:
+                    row_changes.append([])
+                    continue
                 raise RuntimeError("Observation insert returned no record")
             observation_id = inserted.data[0]["observation_id"]
 
@@ -1000,8 +1047,6 @@ def persist_event_history(df):
                     "raw_title": prior.get("raw_title"), "summary": prior.get("raw_summary"),
                 }
             changes = build_change_records(previous_state, state)
-            if previous_state is None:
-                changes.insert(0, ("first_observed", None, None, "First observed by CatWatch"))
 
             change_payloads = []
             for field, old, new, text in changes:
@@ -1017,7 +1062,7 @@ def persist_event_history(df):
                 })
             if change_payloads:
                 client.table("changes").insert(change_payloads).execute()
-            current_change_texts = [item[3] for item in changes]
+            current_change_texts = [item[3] for item in changes if item[0] != "source_text"]
             row_changes.append(current_change_texts)
         except Exception as exc:
             failures.append(f"{event_key}: {str(exc)[:120]}")
@@ -1047,6 +1092,10 @@ def get_event_timeline(event_key, limit=25):
         return response.data or []
     except Exception:
         return []
+
+
+def timeline_update_count(changes):
+    return len({item.get("observation_id") for item in changes if item.get("observation_id") is not None})
 
 
 def get_history_events():
@@ -1771,8 +1820,10 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
 
             has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
             event_key = str(row.get("event_id") or tracking_key(row))
-            timeline = get_event_timeline(event_key, limit=20)
-            with st.expander(f"Change history ({len(timeline)})"):
+            timeline = get_event_timeline(event_key, limit=100)
+            update_count = timeline_update_count(timeline)
+            update_label = "update" if update_count == 1 else "updates"
+            with st.expander(f"Change history ({update_count} {update_label})"):
                 render_event_timeline(event_key, compact=True)
             ncol, mcol = st.columns(2)
             with ncol:
