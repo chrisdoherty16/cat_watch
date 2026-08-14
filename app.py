@@ -283,6 +283,98 @@ def clean_optional_text(value):
     return "" if text.lower() in {"nan", "none", "nat"} else text
 
 
+def extract_nhc_storm_name(raw_title, summary=""):
+    """Extract a named NHC storm without treating forecast prose as its name."""
+    raw_title = clean_optional_text(raw_title)
+    summary = clean_optional_text(summary)
+    status_terms = (
+        "potential tropical cyclone|post-tropical cyclone|tropical storm|"
+        "tropical depression|major hurricane|hurricane"
+    )
+    stop_words = {
+        "a", "an", "as", "at", "for", "in", "is", "it", "near", "of", "on",
+        "the", "to", "warning", "watch", "outlook", "advisory", "discussion",
+        "forecast", "probabilities", "center", "product",
+    }
+
+    # Product titles are the safest source: "Tropical Storm Lala ..."
+    match = re.search(
+        rf"\b(?:{status_terms})\s+([A-Z][A-Za-z-]+)\b",
+        raw_title,
+        flags=re.IGNORECASE,
+    )
+    if match and match.group(1).casefold() not in stop_words:
+        return title_case_storm_token(match.group(1))
+
+    # NHC bulletin headlines often use "LALA FORECAST/ADVISORY...".
+    match = re.search(
+        r"(?:^|[. ]{2,})([A-Z][A-Z-]{2,})\s+"
+        r"(?:FORECAST|ADVISORY|DISCUSSION|WIND|PUBLIC)\b",
+        summary,
+    )
+    if match and match.group(1).casefold() not in stop_words:
+        return title_case_storm_token(match.group(1))
+
+    # Explicit status + name in the summary is acceptable only when it is not
+    # preceded by forecast language such as "become a hurricane as...".
+    for match in re.finditer(
+        rf"\b(?:{status_terms})\s+([A-Z][A-Za-z-]+)\b",
+        summary,
+        flags=re.IGNORECASE,
+    ):
+        candidate = match.group(1)
+        prefix = summary[max(0, match.start() - 35):match.start()].casefold()
+        if candidate.casefold() in stop_words:
+            continue
+        if re.search(r"(?:forecast|expected|potential|could|may|likely)\s+(?:to\s+)?(?:become|strengthen|intensify)?\s*$", prefix):
+            continue
+        return title_case_storm_token(candidate)
+    return ""
+
+
+def extract_current_storm_status(raw_title, summary=""):
+    """Extract the storm's stated current status, excluding forecast wording."""
+    raw_title = clean_optional_text(raw_title)
+    summary = clean_optional_text(summary)
+    ordered = [
+        ("Post-Tropical Cyclone", r"post-tropical cyclone"),
+        ("Major Hurricane", r"major hurricane"),
+        ("Hurricane", r"hurricane"),
+        ("Tropical Storm", r"tropical storm"),
+        ("Tropical Depression", r"tropical depression"),
+        ("Potential Tropical Cyclone", r"potential tropical cyclone"),
+    ]
+    # The product title states what the system currently is.
+    for label, pattern in ordered:
+        if re.search(rf"\b{pattern}\b", raw_title, flags=re.IGNORECASE):
+            return label
+    # Advisory headers can also state the current classification. Ignore any
+    # match immediately associated with forecast/expected language.
+    for label, pattern in ordered:
+        for match in re.finditer(rf"\b{pattern}\b", summary, flags=re.IGNORECASE):
+            prefix = summary[max(0, match.start() - 40):match.start()].casefold()
+            if re.search(r"(?:forecast|expected|could|may|likely)\s+(?:to\s+)?(?:become|strengthen|intensify)?\s*$", prefix):
+                continue
+            suffix = summary[match.end():match.end() + 45]
+            if re.match(r"\s+[A-Z][A-Za-z-]+\b", suffix):
+                return label
+    return ""
+
+
+def extract_forecast_status(text):
+    """Return a forecast classification separately from the current status."""
+    text = clean_optional_text(text)
+    patterns = [
+        ("Major Hurricane", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?major hurricane"),
+        ("Hurricane", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?hurricane"),
+        ("Tropical Storm", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?tropical storm"),
+    ]
+    for label, pattern in patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return label
+    return ""
+
+
 def nhc_active_storm_key(row):
     if row.get("source") != "NHC" or row.get("peril") != "Tropical Cyclone":
         return ""
@@ -291,18 +383,14 @@ def nhc_active_storm_key(row):
     if is_outlook(raw_title, summary):
         return ""
 
-    # Use the normalized storm name first because different NHC products for the
-    # same named storm do not always expose the same ATCF identifier.
-    ident = extract_tc_identity(raw_title, summary)
-    if ident and not re.fullmatch(r"[A-Z]{2}\d{4,6}", ident, flags=re.IGNORECASE):
-        return f"NHC|NAME|{ident.casefold()}"
+    storm_name = extract_nhc_storm_name(raw_title, summary)
+    if storm_name:
+        return f"NHC|NAME|{storm_name.casefold()}"
 
     atcf_id = clean_optional_text(row.get("atcf_id"))
     if atcf_id:
         return f"ATCF|{atcf_id.upper()}"
-
-    basin = extract_basin(raw_title, summary) or outlook_basin(summary)
-    return f"NHC|{basin.casefold()}|{ident.casefold()}" if ident else ""
+    return ""
 
 def extract_atcf_id(text):
     """Extract an ATCF identifier such as AL032026 from text or a URL."""
@@ -517,11 +605,12 @@ def infer_tier(row):
     if peril == "Tropical Cyclone":
         if "tropical weather outlook" in text:
             return "Advisory"
-        if any(x in text for x in ["major hurricane", "category 4", "category 5", "super typhoon"]) or (wind and wind >= 178):
+        status = clean_optional_text(row.get("status"))
+        if status == "Major Hurricane" or (wind and wind >= 178):
             return "Critical"
-        if any(x in text for x in ["hurricane warning", "typhoon warning", "hurricane", "typhoon"]) or (wind and wind >= 119):
+        if status in {"Hurricane", "Typhoon"} or (wind and wind >= 119):
             return "Watch"
-        if any(x in text for x in ["tropical storm", "formation chance", "disturbance", "outlook"]):
+        if status in {"Tropical Storm", "Tropical Depression", "Potential Tropical Cyclone", "Invest"}:
             return "Advisory"
     if peril in ["Flood", "Volcano", "Wildfire"] and alert in ["Unknown", "Green"]:
         if any(x in text for x in ["evacuation", "displaced", "fatal", "deaths", "emergency"]):
@@ -544,7 +633,8 @@ def fetch_feed(feed):
         lat, lon = extract_latlon(entry)
         link = entry.get("link", feed["url"])
         atcf_id = extract_atcf_id(f"{combo} {link}")
-        status = extract_storm_status(combo) if peril == "Tropical Cyclone" else ""
+        status = extract_current_storm_status(raw_title, summary) if peril == "Tropical Cyclone" else ""
+        forecast_status = extract_forecast_status(combo) if peril == "Tropical Cyclone" else ""
         pressure_mb = extract_pressure_mb(combo)
         advisory_number = extract_advisory_number(combo)
         move_direction, move_kmh = extract_movement(combo)
@@ -559,7 +649,8 @@ def fetch_feed(feed):
             "age": age_label(dt), "peril": peril,
             "alert_level": infer_alert_level(raw_title, summary),
             "magnitude": magnitude, "wind_kmh": wind_kmh,
-            "status": status, "atcf_id": atcf_id, "pressure_mb": pressure_mb,
+            "status": status, "forecast_status": forecast_status,
+            "atcf_id": atcf_id, "pressure_mb": pressure_mb,
             "advisory_number": advisory_number, "move_direction": move_direction,
             "move_kmh": move_kmh, "formation_chance": None,
             "disturbance_code": "", "acres": None, "contained_pct": None,
@@ -931,17 +1022,37 @@ def collapse_nhc_storm_products(df):
             best["published"] = latest_py.strftime("%Y-%m-%d %H:%M UTC")
             best["age"] = age_label(latest_py)
             best["published_sort"] = pd.Timestamp(latest_py)
+        status_rank = {
+            "Potential Tropical Cyclone": 0, "Tropical Depression": 1,
+            "Tropical Storm": 2, "Hurricane": 3, "Major Hurricane": 4,
+            "Post-Tropical Cyclone": 5,
+        }
+        current_statuses = [
+            clean_optional_text(value)
+            for value in g.get("status", pd.Series(dtype=str)).tolist()
+            if clean_optional_text(value)
+        ]
+        if current_statuses:
+            best["status"] = max(current_statuses, key=lambda value: status_rank.get(value, -1))
+        forecast_statuses = [
+            clean_optional_text(value)
+            for value in g.get("forecast_status", pd.Series(dtype=str)).tolist()
+            if clean_optional_text(value)
+        ]
+        best["forecast_status"] = (
+            max(forecast_statuses, key=lambda value: status_rank.get(value, -1))
+            if forecast_statuses else ""
+        )
         products = [p for p in g.get("product_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if p]
         best["source_product_count"] = int(len(g))
         best["source_products"] = ", ".join(products)
         best["event_id"] = str(key)
         best["dedup_key"] = str(key)
         wind_val = best.get("wind_kmh") if pd.notna(best.get("wind_kmh")) else None
-        best["title"] = build_tc_title(best.get("raw_title", ""), best.get("summary", ""), status=best.get("status", ""), wind=wind_val)
-        if len(g) > 1 and best.get("summary"):
-            note = f"NHC products collapsed into this storm card: {best['source_products']}."
-            if note not in str(best.get("summary", "")):
-                best["summary"] = str(best.get("summary", "")) + "\n\n" + note
+        storm_name = extract_nhc_storm_name(best.get("raw_title", ""), best.get("summary", ""))
+        title_source = f"{best.get('status', '')} {storm_name}".strip() if storm_name else best.get("raw_title", "")
+        best["title"] = build_tc_title(title_source, "", status=best.get("status", ""), wind=wind_val)
+        best["tier"] = infer_tier(best)
         collapsed.append(best.drop(labels=[c for c in ["_metric_score", "_product_priority"] if c in best.index]))
         used.update(g.index.tolist())
     untouched = work.drop(index=list(used))
@@ -1231,14 +1342,6 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
             st.markdown(f"#### {row['title']}")
             if row.get("changes"):
                 st.markdown("  ".join(f":blue[**{change}**]" for change in row["changes"]))
-            try:
-                product_count = int(row.get("source_product_count") or 0)
-            except Exception:
-                product_count = 0
-            source_products = clean_optional_text(row.get("source_products"))
-            if row.get("source") == "NHC" and product_count > 1:
-                detail = f": {source_products}" if source_products else ""
-                st.caption(f"Collapsed {product_count} NHC products into one storm card{detail}")
             if row.get("summary"):
                 text = display_summary(row["summary"])
                 if compact:
@@ -1276,11 +1379,10 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
                 st.caption(f"Alert: {row['alert_level']}")
             if pd.notna(row.get("magnitude")):
                 st.caption(f"Magnitude: {row['magnitude']}")
-            if row.get("status"):
-                st.caption(f"Status: {row['status']}")
-            product_type = clean_optional_text(row.get("product_type"))
-            if row.get("source") == "NHC" and product_type:
-                st.caption(f"NHC product: {product_type}")
+            if clean_optional_text(row.get("status")):
+                st.caption(f"Status: {clean_optional_text(row.get('status'))}")
+            if clean_optional_text(row.get("forecast_status")):
+                st.caption(f"Forecast: Expected to become {clean_optional_text(row.get('forecast_status'))}")
             if pd.notna(row.get("wind_kmh")):
                 st.caption(f"Wind: {row['wind_kmh']:.0f} km/h")
             if pd.notna(row.get("pressure_mb")):
