@@ -1400,9 +1400,6 @@ def app():
     st.title("\U0001F310 Global Cat Watch")
     st.caption("GDACS + NHC + CAL FIRE catastrophe monitor with maps, news lookup and desktop alerts.")
     
-    # Initialize peril filter only once
-    if "selected_peril_filter" not in st.session_state:
-        st.session_state.selected_peril_filter = None
 
     with st.sidebar:
         st.header("Controls")
@@ -1472,84 +1469,46 @@ def app():
     st.subheader("Global Event Map")
     render_map(filtered, key="major", height=560)
     
-    # Quick peril filter buttons - single select mode
-    st.caption("Click a peril to filter alerts to that type only:")
-    peril_order = ["Tropical Cyclone", "Wildfire", "Earthquake", "Flood"]
-    
-    cols = st.columns(len(peril_order))
-    for idx, peril in enumerate(peril_order):
-        with cols[idx]:
-            is_selected = st.session_state.selected_peril_filter == peril
-            if is_selected:
-                # Use theme color for selected button
-                button_label = f"✓ {peril_icon(peril)} {peril}"
-                if st.button(button_label, key=f"btn_{peril}", use_container_width=True, 
-                           help="Click again to clear filter"):
-                    st.session_state.selected_peril_filter = None
-                    st.rerun()
-            else:
-                button_label = f"{peril_icon(peril)} {peril}"
-                if st.button(button_label, key=f"btn_{peril}", use_container_width=True):
-                    st.session_state.selected_peril_filter = peril
-                    st.rerun()
-    
-    # Alerts list below map
-    st.subheader("Critical & Watch Alerts")
-    st.caption(f"Showing up to {len(major)} event(s). Critical first, then Watch; newest update first within each tier.")
-    
-    # Filter: if peril selected, show only that; otherwise show all
-    if st.session_state.selected_peril_filter:
-        major_filtered = major[major["peril"] == st.session_state.selected_peril_filter]
-    else:
-        major_filtered = major
-    
-    if major_filtered.empty:
-        st.caption("No Critical or Watch events.")
-    else:
-        render_cards(major_filtered, news_sources, new_ids, ns="major")
-
+    # Single tabbed alert view. This replaces the duplicated quick-filter
+    # buttons and the separate Critical & Watch alert section.
     st.divider()
+    tabs = st.tabs([
+        "All Perils",
+        "Tropical Cyclone",
+        "Wildfire",
+        "Earthquake",
+        "Flood",
+        "Other",
+    ])
 
-    tabs = st.tabs(["Tropical Cyclones", "Earthquakes", "Floods",
-                    "Wildfires", "Other Perils"])
+    tab_views = [
+        ("All Perils", filtered, "all", False),
+        ("Tropical Cyclone", filtered[filtered["peril"] == "Tropical Cyclone"], "tc", False),
+        ("Wildfire", filtered[filtered["peril"] == "Wildfire"], "wf", False),
+        ("Earthquake", filtered[filtered["peril"] == "Earthquake"], "eq", False),
+        ("Flood", filtered[filtered["peril"] == "Flood"], "fl", False),
+        (
+            "Other",
+            filtered[~filtered["peril"].isin([
+                "Tropical Cyclone", "Wildfire", "Earthquake", "Flood"
+            ])],
+            "other",
+            True,
+        ),
+    ]
 
-    with tabs[0]:
-        st.subheader("Tropical Cyclones")
-        tc = filtered[filtered["peril"] == "Tropical Cyclone"]
-        if tc.empty:
-            st.caption("No tropical cyclone events currently.")
-        else:
-            render_cards(tc, news_sources, new_ids, ns="tc")
-    with tabs[1]:
-        st.subheader("Earthquakes")
-        eq = filtered[filtered["peril"] == "Earthquake"]
-        if eq.empty:
-            st.caption("No earthquake events currently.")
-        else:
-            render_cards(eq, news_sources, new_ids, ns="eq")
-    with tabs[2]:
-        st.subheader("Floods")
-        fl = filtered[filtered["peril"] == "Flood"]
-        if fl.empty:
-            st.caption("No flood events currently.")
-        else:
-            render_cards(fl, news_sources, new_ids, ns="fl")
-    with tabs[3]:
-        st.subheader("Wildfires")
-        st.caption("Global wildfires from GDACS (e.g. Europe) plus California incidents from CAL FIRE.")
-        wf = filtered[filtered["peril"] == "Wildfire"]
-        if wf.empty:
-            st.caption("No wildfire events currently.")
-        else:
-            render_cards(wf, news_sources, new_ids, ns="wf")
-    with tabs[4]:
-        st.subheader("Volcano / Drought / Other")
-        other = filtered[filtered["peril"].isin(["Volcano", "Drought", "Other"])]
-        if other.empty:
-            st.caption("No other peril events currently.")
-        else:
-            render_cards(other, news_sources, new_ids, ns="other", compact=True)
-
-
+    for tab, (label, view_df, namespace, compact) in zip(tabs, tab_views):
+        with tab:
+            st.subheader(label)
+            if view_df.empty:
+                st.caption(f"No {label.lower()} events currently.")
+            else:
+                render_cards(
+                    view_df,
+                    news_sources,
+                    new_ids,
+                    ns=namespace,
+                    compact=compact,
+                )
 if __name__ == "__main__":
     app()
