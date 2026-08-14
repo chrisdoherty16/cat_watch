@@ -1070,9 +1070,10 @@ def persist_event_history(df):
 
     out["history_changes"] = row_changes
     if failures:
-        return out, f"History saved with {len(failures)} error(s)."
+        sample = " | ".join(failures[:3])
+        return out, f"{len(failures)} history write error(s). {sample}"
     changed_count = sum(bool(items) for items in row_changes)
-    return out, f"History current. {changed_count} event update(s) recorded."
+    return out, f"History current. {changed_count} genuine event update(s) recorded."
 
 
 def get_event_timeline(event_key, limit=25):
@@ -1094,8 +1095,16 @@ def get_event_timeline(event_key, limit=25):
         return []
 
 
+NON_CHANGE_FIELDS = {"first_observed", "initial_state", "source_text"}
+
+
+def genuine_timeline_changes(changes):
+    return [item for item in changes if item.get("field_name") not in NON_CHANGE_FIELDS]
+
+
 def timeline_update_count(changes):
-    return len({item.get("observation_id") for item in changes if item.get("observation_id") is not None})
+    genuine = genuine_timeline_changes(changes)
+    return len({item.get("observation_id") for item in genuine if item.get("observation_id") is not None})
 
 
 def get_history_events():
@@ -1141,9 +1150,10 @@ def timeline_timestamp(item):
 
 
 def render_event_timeline(event_key, compact=True):
-    changes = get_event_timeline(event_key, limit=20 if compact else 100)
+    all_changes = get_event_timeline(event_key, limit=100)
+    changes = genuine_timeline_changes(all_changes)
     if not changes:
-        st.caption("No recorded changes yet.")
+        st.caption("No changes recorded since first observed.")
         return
     grouped = {}
     for item in changes:
@@ -1157,7 +1167,6 @@ def render_event_timeline(event_key, compact=True):
         source_time = parse_dt(items[0].get("source_updated_at"))
         if detected and source_time and abs((detected - source_time).total_seconds()) >= 60:
             st.caption(f"Detected by CatWatch: {detected.strftime('%d %b %Y · %H:%M UTC')}")
-
 
 def render_history_tab():
     st.subheader("Event History")
@@ -1822,9 +1831,12 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
             event_key = str(row.get("event_id") or tracking_key(row))
             timeline = get_event_timeline(event_key, limit=100)
             update_count = timeline_update_count(timeline)
-            update_label = "update" if update_count == 1 else "updates"
-            with st.expander(f"Change history ({update_count} {update_label})"):
-                render_event_timeline(event_key, compact=True)
+            if update_count:
+                update_label = "change" if update_count == 1 else "changes"
+                with st.expander(f"Change history ({update_count} {update_label})"):
+                    render_event_timeline(event_key, compact=True)
+            else:
+                st.caption("No changes recorded since first observed.")
             ncol, mcol = st.columns(2)
             with ncol:
                 with st.expander("\U0001F4F0 Related news"):
@@ -2041,6 +2053,12 @@ def app():
             else:
                 st.warning(supabase_message)
             st.caption("Persistent history records only changed event states.")
+            prior_history_status = st.session_state.get("history_write_status", "")
+            if prior_history_status:
+                if "error" in prior_history_status.lower():
+                    st.warning(prior_history_status)
+                else:
+                    st.caption(prior_history_status)
 
     refresh_token = f"{auto_count}:{st.session_state.get('refresh_clicks', 0)}"
 
@@ -2054,8 +2072,7 @@ def app():
     if df.empty:
         st.error("No feed items loaded. Check connectivity or source availability.")
         return
-    if history_write_status and "error" in history_write_status.lower():
-        st.warning(history_write_status)
+    st.session_state.history_write_status = history_write_status
 
     new_ids = update_new_ids(set(df["event_id"]), refresh_token)
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
