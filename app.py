@@ -60,6 +60,7 @@ BASIN_MAP = {
 _STOP_LOC_WORDS = {"On", "From", "During", "Until", "Last", "Started", "Ongoing", "In", "At", "Center"}
 
 
+
 def clean_html(value: str) -> str:
     if not value:
         return ""
@@ -1058,11 +1059,11 @@ def peril_icon(peril):
 def _base_geo(fig, height, center=None, show_legend=False):
     fig.update_geos(
         projection_type="natural earth",
-        showland=True, landcolor="#3D5C39",
-        showocean=True, oceancolor="#1E3A5F",
-        showcountries=True, countrycolor="#4A6E3F",
-        showcoastlines=True, coastlinecolor="#6B8E5C",
-        lakecolor="#2A4A7C", bgcolor="rgba(0,0,0,0)",
+        showland=True, landcolor="#1A1F2B",
+        showocean=True, oceancolor="#0E1117",
+        showcountries=True, countrycolor="#39414F",
+        showcoastlines=True, coastlinecolor="#39414F",
+        lakecolor="#0E1117", bgcolor="rgba(0,0,0,0)",
         center=center,
     )
     fig.update_layout(
@@ -1099,8 +1100,7 @@ def render_map(df, key, height=460, show_peril_toggle=True):
         return
 
     m["emoji"] = m["peril"].map(peril_icon)
-    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"] + "<br><em>Click to filter & jump to alert</em>"
-    m["peril_lower"] = m["peril"].str.lower().str.replace(" ", "_")
+    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"]
 
     fig = go.Figure()
     # One trace per tier -> clickable legend filters tiers. Colour halo = tier, emoji = peril.
@@ -1111,7 +1111,6 @@ def render_map(df, key, height=460, show_peril_toggle=True):
         fig.add_trace(go.Scattergeo(
             lat=sub["lat"], lon=sub["lon"], mode="markers+text",
             name=f"{tier} ({len(sub)})", legendrank=TIER_ORDER[tier],
-            customdata=sub[["peril", "event_id"]].values,
             marker=dict(size=TIER_SIZE.get(tier, 10) + 14, color=TIER_HEX.get(tier, "#8C96A0"),
                         opacity=0.32, line=dict(width=1.6, color=TIER_HEX.get(tier, "#8C96A0"))),
             text=sub["emoji"], textposition="middle center",
@@ -1399,7 +1398,6 @@ def app():
     st.set_page_config(page_title=APP_TITLE, page_icon="\U0001F310", layout="wide")
     st.title("\U0001F310 Global Cat Watch")
     st.caption("GDACS + NHC + CAL FIRE catastrophe monitor with maps, news lookup and desktop alerts.")
-    
 
     with st.sidebar:
         st.header("Controls")
@@ -1465,50 +1463,73 @@ def app():
             st.caption("Browser notification permission")
             render_desktop_alerts(alert_df, enabled=True)
 
-    # Map as hero header
-    st.subheader("Global Event Map")
-    render_map(filtered, key="major", height=560)
-    
-    # Single tabbed alert view. This replaces the duplicated quick-filter
-    # buttons and the separate Critical & Watch alert section.
+    render_headline(filtered, new_visible)
     st.divider()
-    tabs = st.tabs([
-        "All Perils",
-        "Tropical Cyclone",
-        "Wildfire",
-        "Earthquake",
-        "Flood",
-        "Other",
-    ])
+    render_material_updates(filtered)
+    st.divider()
+    render_summary(filtered, new_visible)
+    st.divider()
 
-    tab_views = [
-        ("All Perils", filtered, "all", False),
-        ("Tropical Cyclone", filtered[filtered["peril"] == "Tropical Cyclone"], "tc", False),
-        ("Wildfire", filtered[filtered["peril"] == "Wildfire"], "wf", False),
-        ("Earthquake", filtered[filtered["peril"] == "Earthquake"], "eq", False),
-        ("Flood", filtered[filtered["peril"] == "Flood"], "fl", False),
-        (
-            "Other",
-            filtered[~filtered["peril"].isin([
-                "Tropical Cyclone", "Wildfire", "Earthquake", "Flood"
-            ])],
-            "other",
-            True,
-        ),
-    ]
+    tabs = st.tabs(["Major Alerts", "Tropical Cyclones", "Earthquakes", "Floods",
+                    "Wildfires", "Other Perils", "All Events", "Digest", "News Search"])
 
-    for tab, (label, view_df, namespace, compact) in zip(tabs, tab_views):
-        with tab:
-            st.subheader(label)
-            if view_df.empty:
-                st.caption(f"No {label.lower()} events currently.")
-            else:
-                render_cards(
-                    view_df,
-                    news_sources,
-                    new_ids,
-                    ns=namespace,
-                    compact=compact,
+    with tabs[0]:
+        st.subheader("Major Alerts")
+        st.markdown("**Where the action is** \u2014 global event map. Click a tier in the legend to filter.")
+        render_map(filtered, key="major", height=560)
+        st.divider()
+        st.markdown("**Critical & Watch events**")
+        st.caption("Critical first, then Watch; newest source update first within each tier.")
+        render_cards(major, news_sources, new_ids, ns="major")
+    with tabs[1]:
+        st.subheader("Tropical Cyclones")
+        tc = filtered[filtered["peril"] == "Tropical Cyclone"]
+        render_map(tc, key="tc", height=360, show_peril_toggle=False)
+        st.divider()
+        render_cards(tc, news_sources, new_ids, ns="tc")
+    with tabs[2]:
+        st.subheader("Earthquakes")
+        eq = filtered[filtered["peril"] == "Earthquake"]
+        render_map(eq, key="eq", height=360, show_peril_toggle=False)
+        st.divider()
+        render_cards(eq, news_sources, new_ids, ns="eq")
+    with tabs[3]:
+        st.subheader("Floods")
+        fl = filtered[filtered["peril"] == "Flood"]
+        render_map(fl, key="fl", height=360, show_peril_toggle=False)
+        st.divider()
+        render_cards(fl, news_sources, new_ids, ns="fl")
+    with tabs[4]:
+        st.subheader("Wildfires")
+        st.caption("Global wildfires from GDACS (e.g. Europe) plus California incidents from CAL FIRE.")
+        wf = filtered[filtered["peril"] == "Wildfire"]
+        render_map(wf, key="wf", height=360, show_peril_toggle=False)
+        st.divider()
+        render_cards(wf, news_sources, new_ids, ns="wf")
+    with tabs[5]:
+        st.subheader("Volcano / Drought / Other")
+        other = filtered[filtered["peril"].isin(["Volcano", "Drought", "Other"])]
+        render_map(other, key="other", height=360)
+        st.divider()
+        render_cards(other, news_sources, new_ids, ns="other", compact=True)
+    with tabs[6]:
+        st.subheader("All Events")
+        render_table(filtered, new_ids)
+    with tabs[7]:
+        render_digest(filtered, new_ids)
+    with tabs[8]:
+        st.subheader("News Search")
+        st.caption("Free-text search across global news (Google News). Use the sidebar to restrict to specific outlets.")
+        q = st.text_input("Search topic", value="reinsurance catastrophe loss")
+        if q:
+            for it in fetch_news(q, tuple(news_sources)):
+                meta = " \u00B7 ".join(x for x in [it.get("source", ""), it.get("age", "")] if x)
+                st.markdown(
+                    f"- [{it['title']}]({it['link']})  \n"
+                    f"<span style='color:#8A94A6;font-size:0.8em'>{meta}</span>",
+                    unsafe_allow_html=True,
                 )
+
+
 if __name__ == "__main__":
     app()
