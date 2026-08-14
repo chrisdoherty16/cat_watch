@@ -19,6 +19,10 @@ try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 
 APP_TITLE = "Global Cat Watch"
 DEFAULT_REFRESH_MINUTES = 10
@@ -750,6 +754,46 @@ def tracking_key(row):
     if row.get("peril") == "Tropical Cyclone" and name:
         return f"CYCLONE|{name.lower()}"
     return f"{row.get('source','')}|{str(row.get('raw_title','')).strip().lower()}"
+
+
+@st.cache_resource(show_spinner=False)
+def supabase_client():
+    """Create the server-side Supabase client from private Streamlit secrets."""
+    if create_client is None:
+        return None
+    try:
+        config = st.secrets["supabase"]
+        url = str(config["url"]).strip()
+        key = str(config["key"]).strip()
+    except (KeyError, TypeError, AttributeError):
+        return None
+    if not url or not key:
+        return None
+    return create_client(url, key)
+
+
+def supabase_health_check():
+    """Verify that CatWatch can read the history schema without writing data."""
+    if create_client is None:
+        return False, "Supabase package is not installed."
+    try:
+        config = st.secrets["supabase"]
+        if not str(config["url"]).strip() or not str(config["key"]).strip():
+            return False, "Supabase secrets are incomplete."
+    except (KeyError, TypeError, AttributeError):
+        return False, "Supabase secrets are not configured."
+    try:
+        client = supabase_client()
+        if client is None:
+            return False, "Supabase client could not be created."
+        client.table("events").select("event_key").limit(1).execute()
+        return True, "Connected to persistent event history."
+    except Exception as exc:
+        # Do not expose credentials or a full backend exception in the UI.
+        message = str(exc).replace("\n", " ").strip()
+        if len(message) > 180:
+            message = message[:177] + "..."
+        return False, f"Connection failed: {message}"
 
 
 def history_connection():
@@ -1558,6 +1602,14 @@ def app():
         st.subheader("News filter")
         news_labels = st.multiselect("Preferred news sources (blank = all)", list(NEWS_SOURCES.keys()), default=[])
         news_sources = [NEWS_SOURCES[l] for l in news_labels]
+        st.divider()
+        with st.expander("System status"):
+            supabase_ok, supabase_message = supabase_health_check()
+            if supabase_ok:
+                st.success(supabase_message)
+            else:
+                st.warning(supabase_message)
+            st.caption("This check is read-only. Event history is not being written yet.")
 
     refresh_token = f"{auto_count}:{st.session_state.get('refresh_clicks', 0)}"
 
