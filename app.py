@@ -25,8 +25,18 @@ try:
     from supabase import create_client
 except Exception:
     create_client = None
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+try:
+    from pydantic import BaseModel, Field
+except Exception:
+    BaseModel = None
 
 APP_TITLE = "Global Cat Watch"
+# Free-tier Gemini Flash model. Change here if Google renames the free model.
+GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_REFRESH_MINUTES = 10
 HISTORY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cat_event_history.db")
 REQUEST_HEADERS = {"User-Agent": "GlobalCatWatch/1.0 (monitoring dashboard)"}
@@ -784,6 +794,97 @@ def fetch_nhc_product_text(url):
     except Exception:
         return ""
     return clean_bulletin_text(raw)
+
+
+# --- Optional AI parsing (Gemini) -------------------------------------------
+# The full bulletin text is fed to a small, fast model to produce a clean,
+# structured brief. This is strictly additive: if the API key or library is
+# absent, or anything fails, the app falls back to the regex extraction and the
+# rest of the card is unchanged. The model does basic reading comprehension,
+# not judgement — it restates what the bulletin says in a consistent shape.
+if BaseModel is not None:
+    class StormBrief(BaseModel):
+        current_status: str = Field(default="", description="e.g. Tropical Storm, Hurricane")
+        category: str = Field(default="", description="Saffir-Simpson category if a hurricane, e.g. '1'")
+        forecast_status: str = Field(default="", description="peak status the storm is forecast to reach")
+        forecast_by: str = Field(default="", description="when it is forecast to reach that status, e.g. 'by Wednesday'")
+        landfall_location: str = Field(default="", description="forecast landfall/closest-approach place, if any")
+        landfall_window: str = Field(default="", description="timing of that landfall/approach, if stated")
+        key_threats: list[str] = Field(default_factory=list, description="up to 3 short hazard phrases")
+        underwriter_summary: str = Field(default="", description="one plain sentence an underwriter would say")
+else:
+    StormBrief = None
+
+
+def gemini_available():
+    """True only if the library is importable and an API key is configured."""
+    if genai is None:
+        return False
+    try:
+        return bool(str(st.secrets.get("GEMINI_API_KEY", "")).strip())
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def _gemini_model():
+    """Configure and cache the Gemini model, or None if unavailable."""
+    if not gemini_available():
+        return None
+    try:
+        genai.configure(api_key=str(st.secrets["GEMINI_API_KEY"]).strip())
+        return genai.GenerativeModel(GEMINI_MODEL)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def ai_storm_brief(bulletin_text, storm_name=""):
+    """Return a structured brief dict for a storm bulletin, or None on any
+    failure. Cached on the bulletin text so each advisory is parsed once. The
+    30-minute TTL and per-text cache keep free-tier usage to a trickle."""
+    text = (bulletin_text or "").strip()
+    if len(text) < 40:
+        return None
+    model = _gemini_model()
+    if model is None:
+        return None
+    prompt = (
+        "You are parsing an official US National Hurricane Center tropical "
+        "cyclone bulletin. Extract ONLY what the text states; never invent "
+        "values; leave a field blank if not stated. Respond with strict JSON "
+        "matching these keys: current_status, category, forecast_status, "
+        "forecast_by, landfall_location, landfall_window, key_threats (array of "
+        "up to 3 short strings), underwriter_summary (one plain sentence a "
+        "reinsurance underwriter would say to a colleague, e.g. 'TS Lala, "
+        "forecast to re-strengthen to a hurricane by Wednesday, moving away "
+        "from Hawaii').\n\n"
+        f"Storm: {storm_name or 'unknown'}\n\nBULLETIN:\n{text[:6000]}"
+    )
+    try:
+        resp = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json", "temperature": 0},
+        )
+        data = json.loads(resp.text)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Normalise: coerce to the expected shape defensively.
+    threats = data.get("key_threats") or []
+    if isinstance(threats, str):
+        threats = [threats]
+    return {
+        "current_status": str(data.get("current_status", "")).strip(),
+        "category": str(data.get("category", "")).strip(),
+        "forecast_status": str(data.get("forecast_status", "")).strip(),
+        "forecast_by": str(data.get("forecast_by", "")).strip(),
+        "landfall_location": str(data.get("landfall_location", "")).strip(),
+        "landfall_window": str(data.get("landfall_window", "")).strip(),
+        "key_threats": [str(t).strip() for t in threats if str(t).strip()][:3],
+        "underwriter_summary": str(data.get("underwriter_summary", "")).strip(),
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1625,15 +1726,36 @@ def compute_observation_timeline(observations, peril=""):
         observations,
         key=lambda o: (o.get("source_updated_at") or o.get("detected_at") or ""),
     )
+    # Best-known forecast timing ("by Wednesday"): the forecast-to-become-hurricane
+    # window is a persistent, current fact. Older observations that recorded the
+    # forecast transition may have stored only the thin RSS summary (before full
+    # bulletin text was fetched), so their timing is blank. Take the timing from
+    # the most recent observation that has one and attach it to the forecast
+    # entry, so the change log reflects the current forecast window rather than a
+    # stale blank.
+    latest_timing = ""
+    for obs in reversed(ordered):
+        candidate = clean_optional_text(obs.get("forecast_timing")) or extract_forecast_timing(
+            obs.get("raw_summary") or obs.get("summary")
+        )
+        if candidate:
+            latest_timing = candidate
+            break
     entries = []
     prev_state = None
     for obs in ordered:
         state = prior_state_from_observation(obs)
         records = build_change_records(prev_state, state, peril=peril)
-        texts = [
-            text for field, _old, _new, text in records
-            if field not in {"first_observed", "initial_state", "source_text"}
-        ]
+        texts = []
+        for field, _old, _new, text in records:
+            if field in {"first_observed", "initial_state", "source_text"}:
+                continue
+            # If a forecast entry lacks the timing (thin stored text) but the
+            # current forecast window is known, append it.
+            if (field == "forecast_status" and latest_timing
+                    and " by " not in text and "within " not in text):
+                text = f"{text} {latest_timing}"
+            texts.append(text)
         if texts:
             entries.append({
                 "source_time": obs.get("source_updated_at") or obs.get("detected_at"),
@@ -2357,6 +2479,18 @@ def render_event_card(row, news_sources, new_ids, observations_lookup=None, ns="
                 head += "  \u00B7  :green[\U0001F195 NEW]"
             st.markdown(head)
             st.markdown(f"#### {row['title']}")
+            # AI brief: a single plain-language line for named tropical cyclones,
+            # generated from the full bulletin. Strictly optional and cached; if
+            # no key or any failure, nothing renders and the card is unchanged.
+            if (row.get("peril") == "Tropical Cyclone" and row.get("source") == "NHC"
+                    and not is_outlook(row.get("raw_title", ""), row.get("summary", ""))
+                    and gemini_available()):
+                brief = ai_storm_brief(row.get("summary", ""), extract_nhc_storm_name(
+                    row.get("raw_title", ""), row.get("summary", "")))
+                if brief and brief.get("underwriter_summary"):
+                    st.markdown(f":violet[**\U0001F9E0 {brief['underwriter_summary']}**]")
+                    if brief.get("key_threats"):
+                        st.caption("Threats: " + " · ".join(brief["key_threats"]))
             if row.get("changes"):
                 st.markdown("  ".join(f":blue[**{change}**]" for change in row["changes"]))
             if row.get("summary"):
