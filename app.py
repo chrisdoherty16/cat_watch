@@ -437,6 +437,104 @@ def extract_forecast_status(text):
     return ""
 
 
+def extract_forecast_timing(text):
+    """When a forecast intensification is expected, e.g. 'by Wednesday' or
+    'within 48h'. Scoped to the intensification clause so unrelated dates in the
+    advisory (e.g. movement turns) are not picked up."""
+    text = clean_optional_text(text)
+    if not text:
+        return ""
+    clause = re.search(
+        r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify|re-?strengthen)[^.]*",
+        text, flags=re.IGNORECASE,
+    )
+    scope = clause.group(0) if clause else ""
+    if not scope:
+        # Also handle "restrengthening is expected ... become a hurricane by X".
+        clause = re.search(r"re-?strengthening[^.]*", text, flags=re.IGNORECASE)
+        scope = clause.group(0) if clause else ""
+    if not scope:
+        return ""
+    m = re.search(
+        r"\bby\s+(?:late\s+|early\s+)?(Monday|Tuesday|Wednesday|Thursday|Friday|"
+        r"Saturday|Sunday|tonight|tomorrow|this evening|this morning|midweek)\b",
+        scope, flags=re.IGNORECASE,
+    )
+    if m:
+        return f"by {m.group(1)}"
+    m = re.search(r"\bwithin\s+(?:the\s+next\s+)?(\d{1,3})\s*hours", scope, flags=re.IGNORECASE)
+    if m:
+        return f"within {m.group(1)}h"
+    return ""
+
+
+def extract_formation_windows(summary):
+    """Parse NHC outlook formation chances per disturbance for both the 48-hour
+    and 7-day windows, returning {code: {'h48': int|None, 'd7': int|None}}."""
+    parts = list(re.finditer(r"\(([A-Z]{2}9\d)\)", summary or ""))
+    result = {}
+    for i, m in enumerate(parts):
+        code = m.group(1).upper()
+        start = m.end()
+        end = parts[i + 1].start() if i + 1 < len(parts) else len(summary)
+        block = summary[start:end]
+        h48 = re.search(r"through\s+48\s+hours\D*?(\d{1,3})\s*percent", block, flags=re.IGNORECASE)
+        d7 = re.search(r"through\s+7\s+days\D*?(\d{1,3})\s*percent", block, flags=re.IGNORECASE)
+        result[code] = {
+            "h48": int(h48.group(1)) if h48 else None,
+            "d7": int(d7.group(1)) if d7 else None,
+        }
+    return result
+
+
+def extract_population_affected(summary):
+    """GDACS states estimated population exposed, e.g. 'population affected by
+    category 1 (120 km/h) wind speeds or higher is 11,938'."""
+    # Anchor to the "... is <number>" clause so intervening figures such as the
+    # "category 1" or "(120 km/h)" in the GDACS wording are not mistaken for the
+    # population count.
+    m = re.search(
+        r"population affected.*?\bis\s+([0-9][0-9,\.]*)\s*(million|thousand)?",
+        summary or "", flags=re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r"([0-9][0-9,\.]*)\s*(million|thousand)?\s+people\s+(?:were\s+)?affected",
+            summary or "", flags=re.IGNORECASE,
+        )
+    if not m:
+        return None
+    try:
+        value = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    scale = (m.group(2) or "").lower()
+    if scale == "million":
+        value *= 1_000_000
+    elif scale == "thousand":
+        value *= 1_000
+    return int(value)
+
+
+def extract_vulnerability(summary):
+    """GDACS notes a qualitative vulnerability, e.g. '(vulnerability HIGH)'."""
+    m = re.search(r"vulnerability\s+(VERY HIGH|HIGH|MEDIUM|LOW)", summary or "", flags=re.IGNORECASE)
+    return m.group(1).title() if m else ""
+
+
+def format_population(value):
+    """Compact human-readable exposed-population string."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M".replace(".0M", "M")
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k".replace(".0k", "k")
+    return f"{value:,.0f}"
+
+
 def nhc_active_storm_key(row):
     if row.get("source") != "NHC" or row.get("peril") != "Tropical Cyclone":
         return ""
@@ -728,6 +826,9 @@ def fetch_feed(feed):
         is_named_tc_row = peril == "Tropical Cyclone" and not is_outlook(raw_title, summary)
         status = extract_current_storm_status(raw_title, summary) if is_named_tc_row else ""
         forecast_status = extract_forecast_status(combo) if is_named_tc_row else ""
+        forecast_timing = extract_forecast_timing(combo) if is_named_tc_row else ""
+        population_affected = extract_population_affected(summary)
+        vulnerability = extract_vulnerability(summary)
         pressure_mb = extract_pressure_mb(combo)
         advisory_number = extract_advisory_number(combo)
         move_direction, move_kmh = extract_movement(combo)
@@ -743,23 +844,36 @@ def fetch_feed(feed):
             "alert_level": infer_alert_level(raw_title, summary),
             "magnitude": magnitude, "wind_kmh": wind_kmh,
             "status": status, "forecast_status": forecast_status,
+            "forecast_timing": forecast_timing,
             "atcf_id": atcf_id, "pressure_mb": pressure_mb,
             "advisory_number": advisory_number, "move_direction": move_direction,
             "move_kmh": move_kmh, "formation_chance": None,
+            "formation_chance_48h": None, "formation_chance_7d": None,
+            "population_affected": population_affected, "vulnerability": vulnerability,
             "disturbance_code": "", "acres": None, "contained_pct": None,
             "lat": lat, "lon": lon, "product_type": product_type,
             "source_product_count": 1, "source_products": product_type,
         }
         row["tier"] = infer_tier(row)
-        systems = extract_formation_chances(summary) if is_outlook(raw_title, summary) else {}
-        if systems:
-            for code, chance in systems.items():
+        windows = extract_formation_windows(summary) if is_outlook(raw_title, summary) else {}
+        if windows:
+            for code, w in windows.items():
+                h48, d7 = w.get("h48"), w.get("d7")
+                chance = max([p for p in (h48, d7) if p is not None], default=None)
                 system_row = dict(row)
                 system_row["disturbance_code"] = code
                 system_row["formation_chance"] = chance
+                system_row["formation_chance_48h"] = h48
+                system_row["formation_chance_7d"] = d7
                 system_row["status"] = "Invest"
                 system_row["raw_title"] = f"{code} Tropical Disturbance"
-                system_row["title"] = f"Tropical Disturbance {code}" + (f" - {chance}% formation chance" if chance is not None else "")
+                window_bits = []
+                if h48 is not None:
+                    window_bits.append(f"48h {h48}%")
+                if d7 is not None:
+                    window_bits.append(f"7d {d7}%")
+                tail = f" - {' · '.join(window_bits)} formation" if window_bits else ""
+                system_row["title"] = f"Tropical Disturbance {code}{tail}"
                 system_row["link"] = link
                 rows.append(system_row)
         else:
@@ -1129,13 +1243,15 @@ def tc_change_records(previous, current):
             f"{direction} to Cat {cur_cat} (from Cat {prev_cat})",
         ))
 
-    # 3. Forecast intensification target.
+    # 3. Forecast intensification target, with expected timing when stated.
     prev_fore = clean_optional_text(previous.get("forecast_status"))
     cur_fore = clean_optional_text(current.get("forecast_status"))
     if cur_fore and cur_fore != prev_fore:
+        timing = extract_forecast_timing(current.get("summary"))
+        timing_txt = f" {timing}" if timing else ""
         records.append((
             "forecast_status", prev_fore or None, cur_fore,
-            f"Now forecast to reach {cur_fore}",
+            f"Now forecast to reach {cur_fore}{timing_txt}",
         ))
 
     # 4. Forecast track / landfall threat.
@@ -1158,7 +1274,8 @@ def tc_initial_state_text(current):
         parts.append(tc_status_with_category(status, category))
     forecast = clean_optional_text(current.get("forecast_status"))
     if forecast:
-        parts.append(f"forecast {forecast}")
+        timing = extract_forecast_timing(current.get("summary"))
+        parts.append(f"forecast {forecast}{(' ' + timing) if timing else ''}")
     threat = tc_threat_text(current.get("summary"))
     if threat:
         parts.append(f"track {threat}")
@@ -2305,13 +2422,29 @@ def render_event_card(row, news_sources, new_ids, observations_lookup=None, ns="
             if clean_optional_text(row.get("status")):
                 st.caption(f"Status: {clean_optional_text(row.get('status'))}")
             if clean_optional_text(row.get("forecast_status")):
-                st.caption(f"Forecast: Expected to become {clean_optional_text(row.get('forecast_status'))}")
+                forecast_line = f"Forecast: Expected to become {clean_optional_text(row.get('forecast_status'))}"
+                timing = clean_optional_text(row.get("forecast_timing")) or extract_forecast_timing(row.get("summary"))
+                if timing:
+                    forecast_line += f" {timing}"
+                st.caption(forecast_line)
             if pd.notna(row.get("wind_kmh")):
                 st.caption(f"Wind: {row['wind_kmh']:.0f} km/h")
             if pd.notna(row.get("pressure_mb")):
                 st.caption(f"Pressure: {row['pressure_mb']:.0f} mb")
-            if pd.notna(row.get("formation_chance")):
+            h48, d7 = row.get("formation_chance_48h"), row.get("formation_chance_7d")
+            if pd.notna(h48) or pd.notna(d7):
+                bits = []
+                if pd.notna(h48):
+                    bits.append(f"48h {h48:.0f}%")
+                if pd.notna(d7):
+                    bits.append(f"7d {d7:.0f}%")
+                st.caption(f"Formation: {' · '.join(bits)}")
+            elif pd.notna(row.get("formation_chance")):
                 st.caption(f"Formation chance: {row['formation_chance']:.0f}%")
+            if pd.notna(row.get("population_affected")):
+                st.caption(f"Population exposed: {format_population(row.get('population_affected'))}")
+            if clean_optional_text(row.get("vulnerability")):
+                st.caption(f"Vulnerability: {clean_optional_text(row.get('vulnerability'))}")
             if pd.notna(row.get("acres")):
                 st.caption(f"Area: {row['acres']:,.0f} acres")
             if pd.notna(row.get("contained_pct")):
@@ -2468,8 +2601,20 @@ def app():
         alert_material = st.checkbox("Material status and metric changes", value=True, disabled=not desktop_alerts)
         alert_major = st.checkbox("New Critical/Watch events", value=True, disabled=not desktop_alerts)
         st.divider()
-        time_window = st.selectbox("Time window", ["24 hours", "7 days", "30 days", "All available"], index=1)
-        hours_lookup = {"24 hours": 24, "7 days": 168, "30 days": 720, "All available": None}
+        time_window = st.selectbox(
+            "Show events updated within",
+            ["24 hours", "2 days", "7 days", "30 days", "All available"],
+            index=1,
+            help=(
+                "Filters on each event's most recent update, not its age. An "
+                "active system that keeps issuing advisories stays visible; a "
+                "storm that has gone silent (e.g. dissipated) drops off once it "
+                "passes this threshold. NHC/CPHC issue advisories roughly every "
+                "6 hours for active cyclones, so a 2-day silence usually means "
+                "the final advisory has been issued."
+            ),
+        )
+        hours_lookup = {"24 hours": 24, "2 days": 48, "7 days": 168, "30 days": 720, "All available": None}
         min_tier = st.selectbox("Minimum tier", ["Critical", "Watch", "Advisory", "Info"], index=2)
         perils = st.multiselect("Perils", PERIL_ORDER, default=PERIL_ORDER)
         sources = st.multiselect("Sources", ["GDACS", "NHC", "CAL FIRE"], default=["GDACS", "NHC", "CAL FIRE"])
