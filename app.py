@@ -1180,19 +1180,22 @@ NON_CHANGE_FIELDS = {"first_observed", "initial_state", "source_text"}
 
 
 def genuine_timeline_changes(changes, peril=None):
+    """Show all genuine stored history while excluding the initial baseline.
+
+    Cyclone materiality is controlled when new change records are created and
+    when desktop alerts are assembled. Historical records are not filtered by
+    field name, so previously captured cyclone and non-cyclone changes remain
+    visible and auditable.
+    """
     baseline_ids = {
         item.get("observation_id") for item in changes
         if item.get("field_name") in {"first_observed", "initial_state"}
     }
-    filtered = [
+    return [
         item for item in changes
         if item.get("field_name") not in NON_CHANGE_FIELDS
         and item.get("observation_id") not in baseline_ids
     ]
-    if peril == "Tropical Cyclone":
-        allowed = {"cyclone_stage", "forecast_status", "formation_milestone"}
-        filtered = [item for item in filtered if item.get("field_name") in allowed]
-    return filtered
 
 
 def timeline_update_count(changes, peril=None):
