@@ -4,6 +4,7 @@ import os
 import sqlite3
 import hashlib
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from html import unescape
 
@@ -936,145 +937,146 @@ def build_change_records(previous, current):
         changes.append(("source_text", None, None, "Source text updated"))
     return changes
 
-def persist_event_history(df):
-    """Write only genuinely changed event states to Supabase."""
-    client = supabase_client()
+def chunked(items, size=100):
+    items = list(items)
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
+
+
+def prior_state_from_observation(prior):
+    if not prior:
+        return None
+    return {
+        "status": prior.get("status"), "forecast_status": prior.get("forecast_status"),
+        "wind_kmh": prior.get("wind_kmh"), "pressure_mb": prior.get("pressure_mb"),
+        "formation_chance": prior.get("formation_chance"),
+        "move_direction": prior.get("movement_direction"), "move_kmh": prior.get("movement_kmh"),
+        "lat": prior.get("latitude"), "lon": prior.get("longitude"),
+        "magnitude": prior.get("magnitude"), "acres": prior.get("acres"),
+        "contained_pct": prior.get("contained_pct"), "alert_level": prior.get("alert_level"),
+        "tier": prior.get("tier"), "advisory_number": prior.get("advisory_number"),
+        "raw_title": prior.get("raw_title"), "summary": prior.get("raw_summary"),
+    }
+
+
+def fetch_latest_observations(client, event_keys):
+    """Load latest saved observations in batches instead of one request per event."""
+    latest = {}
+    fields = (
+        "observation_id,event_key,detected_at,observation_hash,status,forecast_status,"
+        "wind_kmh,pressure_mb,formation_chance,movement_direction,movement_kmh,"
+        "latitude,longitude,magnitude,acres,contained_pct,alert_level,tier,"
+        "advisory_number,raw_title,raw_summary"
+    )
+    for keys in chunked(event_keys, 100):
+        response = (
+            client.table("observations")
+            .select(fields)
+            .in_("event_key", keys)
+            .order("detected_at", desc=True)
+            .limit(5000)
+            .execute()
+        )
+        for item in response.data or []:
+            latest.setdefault(item.get("event_key"), item)
+    return latest
+
+
+def persist_event_history(df, client=None):
+    """Batch history reads/upserts; write observations only for genuine new states."""
+    client = client or supabase_client()
     if client is None or df.empty:
-        return df, "Persistent history unavailable."
+        out = df.copy()
+        out["history_changes"] = [[] for _ in range(len(out))]
+        return out, "Persistent history unavailable."
 
     out = df.copy()
-    row_changes = []
-    failures = []
     detected_at = datetime.now(timezone.utc).isoformat()
-
+    prepared = []
+    event_payloads = []
     for _, row in out.iterrows():
         event_key = str(row.get("event_id") or tracking_key(row))
-        source_updated_at = iso_utc(row.get("published_utc"))
         state = observation_state(row)
-        state_hash = observation_hash(state)
-        current_change_texts = []
+        prepared.append((row, event_key, state, observation_hash(state)))
+        event_payloads.append({
+            "event_key": event_key,
+            "peril": clean_optional_text(row.get("peril")) or "Other",
+            "source": clean_optional_text(row.get("source")) or "Unknown",
+            "display_name": clean_optional_text(row.get("title")) or event_key,
+            "last_seen_at": detected_at,
+            "active": True,
+            "latest_source_url": clean_optional_text(row.get("link")) or None,
+            "updated_at": detected_at,
+        })
+
+    failures = []
+    try:
+        for payload_batch in chunked(event_payloads, 100):
+            client.table("events").upsert(payload_batch, on_conflict="event_key").execute()
+        latest_by_key = fetch_latest_observations(client, [item[1] for item in prepared])
+    except Exception as exc:
+        out["history_changes"] = [[] for _ in range(len(out))]
+        return out, f"History batch read failed: {str(exc)[:180]}"
+
+    row_changes = []
+    for row, event_key, state, state_hash in prepared:
+        prior = latest_by_key.get(event_key)
+        if prior and prior.get("observation_hash") == state_hash:
+            row_changes.append([])
+            continue
+        source_updated_at = iso_utc(row.get("published_utc"))
+        observation_payload = {
+            "event_key": event_key, "detected_at": detected_at,
+            "source_updated_at": source_updated_at,
+            "status": state.get("status"), "forecast_status": state.get("forecast_status"),
+            "wind_kmh": state.get("wind_kmh"), "pressure_mb": state.get("pressure_mb"),
+            "formation_chance": state.get("formation_chance"),
+            "movement_direction": state.get("move_direction"), "movement_kmh": state.get("move_kmh"),
+            "latitude": state.get("lat"), "longitude": state.get("lon"),
+            "magnitude": state.get("magnitude"), "acres": state.get("acres"),
+            "contained_pct": state.get("contained_pct"), "alert_level": state.get("alert_level"),
+            "tier": state.get("tier"), "advisory_number": state.get("advisory_number"),
+            "raw_title": state.get("raw_title"), "raw_summary": state.get("summary"),
+            "source_url": clean_optional_text(row.get("link")) or None,
+            "observation_hash": state_hash,
+        }
         try:
-            event_payload = {
-                "event_key": event_key,
-                "peril": clean_optional_text(row.get("peril")) or "Other",
-                "source": clean_optional_text(row.get("source")) or "Unknown",
-                "display_name": clean_optional_text(row.get("title")) or event_key,
-                "last_seen_at": detected_at,
-                "active": True,
-                "latest_source_url": clean_optional_text(row.get("link")) or None,
-                "updated_at": detected_at,
-            }
-            client.table("events").upsert(event_payload, on_conflict="event_key").execute()
-
-            prior_response = (
-                client.table("observations")
-                .select("*")
-                .eq("event_key", event_key)
-                .order("detected_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            prior = prior_response.data[0] if prior_response.data else None
-            if prior and prior.get("observation_hash") == state_hash:
-                row_changes.append([])
-                continue
-
-            observation_payload = {
-                "event_key": event_key,
-                "detected_at": detected_at,
-                "source_updated_at": source_updated_at,
-                "status": state.get("status"),
-                "forecast_status": state.get("forecast_status"),
-                "wind_kmh": state.get("wind_kmh"),
-                "pressure_mb": state.get("pressure_mb"),
-                "formation_chance": state.get("formation_chance"),
-                "movement_direction": state.get("move_direction"),
-                "movement_kmh": state.get("move_kmh"),
-                "latitude": state.get("lat"),
-                "longitude": state.get("lon"),
-                "magnitude": state.get("magnitude"),
-                "acres": state.get("acres"),
-                "contained_pct": state.get("contained_pct"),
-                "alert_level": state.get("alert_level"),
-                "tier": state.get("tier"),
-                "advisory_number": state.get("advisory_number"),
-                "raw_title": state.get("raw_title"),
-                "raw_summary": state.get("summary"),
-                "source_url": clean_optional_text(row.get("link")) or None,
-                "observation_hash": state_hash,
-            }
             try:
                 inserted = client.table("observations").insert(observation_payload).execute()
             except Exception:
                 existing = (
-                    client.table("observations")
-                    .select("observation_id")
-                    .eq("event_key", event_key)
-                    .eq("observation_hash", state_hash)
-                    .limit(1)
-                    .execute()
+                    client.table("observations").select("observation_id")
+                    .eq("event_key", event_key).eq("observation_hash", state_hash)
+                    .limit(1).execute()
                 )
                 if existing.data:
                     row_changes.append([])
                     continue
                 raise
             if not inserted.data:
-                existing = (
-                    client.table("observations")
-                    .select("observation_id")
-                    .eq("event_key", event_key)
-                    .eq("observation_hash", state_hash)
-                    .limit(1)
-                    .execute()
-                )
-                if existing.data:
-                    row_changes.append([])
-                    continue
                 raise RuntimeError("Observation insert returned no record")
             observation_id = inserted.data[0]["observation_id"]
-
-            previous_state = None
-            if prior:
-                previous_state = {
-                    "status": prior.get("status"), "forecast_status": prior.get("forecast_status"),
-                    "wind_kmh": prior.get("wind_kmh"), "pressure_mb": prior.get("pressure_mb"),
-                    "formation_chance": prior.get("formation_chance"),
-                    "move_direction": prior.get("movement_direction"), "move_kmh": prior.get("movement_kmh"),
-                    "lat": prior.get("latitude"), "lon": prior.get("longitude"),
-                    "magnitude": prior.get("magnitude"), "acres": prior.get("acres"),
-                    "contained_pct": prior.get("contained_pct"), "alert_level": prior.get("alert_level"),
-                    "tier": prior.get("tier"), "advisory_number": prior.get("advisory_number"),
-                    "raw_title": prior.get("raw_title"), "summary": prior.get("raw_summary"),
-                }
-            changes = build_change_records(previous_state, state)
-
-            change_payloads = []
-            for field, old, new, text in changes:
-                change_payloads.append({
-                    "event_key": event_key,
-                    "observation_id": observation_id,
-                    "detected_at": detected_at,
-                    "source_updated_at": source_updated_at,
-                    "field_name": field,
-                    "previous_value": None if old is None else str(old),
-                    "current_value": None if new is None else str(new),
-                    "change_text": text,
-                })
-            if change_payloads:
-                client.table("changes").insert(change_payloads).execute()
-            current_change_texts = [item[3] for item in changes if item[0] != "source_text"]
-            row_changes.append(current_change_texts)
+            changes = build_change_records(prior_state_from_observation(prior), state)
+            payloads = [{
+                "event_key": event_key, "observation_id": observation_id,
+                "detected_at": detected_at, "source_updated_at": source_updated_at,
+                "field_name": field,
+                "previous_value": None if old is None else str(old),
+                "current_value": None if new is None else str(new),
+                "change_text": text,
+            } for field, old, new, text in changes]
+            if payloads:
+                client.table("changes").insert(payloads).execute()
+            row_changes.append([item[3] for item in changes if item[0] != "source_text"])
         except Exception as exc:
             failures.append(f"{event_key}: {str(exc)[:120]}")
             row_changes.append([])
 
     out["history_changes"] = row_changes
     if failures:
-        sample = " | ".join(failures[:3])
-        return out, f"{len(failures)} history write error(s). {sample}"
+        return out, f"{len(failures)} history write error(s). {' | '.join(failures[:3])}"
     changed_count = sum(bool(items) for items in row_changes)
     return out, f"History current. {changed_count} genuine event update(s) recorded."
-
 
 def get_event_timeline(event_key, limit=25):
     client = supabase_client()
@@ -1116,6 +1118,31 @@ def genuine_timeline_changes(changes):
 def timeline_update_count(changes):
     genuine = genuine_timeline_changes(changes)
     return len({item.get("observation_id") for item in genuine if item.get("observation_id") is not None})
+
+
+def get_timelines_for_events(event_keys, client=None, per_event_limit=100):
+    """Load all visible card timelines in a few requests and group them locally."""
+    client = client or supabase_client()
+    timelines = {str(key): [] for key in event_keys}
+    if client is None or not timelines:
+        return timelines
+    fields = "change_id,event_key,observation_id,detected_at,source_updated_at,change_text,field_name"
+    try:
+        for keys in chunked(timelines.keys(), 100):
+            response = (
+                client.table("changes").select(fields)
+                .in_("event_key", keys)
+                .order("source_updated_at", desc=True)
+                .order("detected_at", desc=True)
+                .limit(10000).execute()
+            )
+            for item in response.data or []:
+                key = str(item.get("event_key"))
+                if key in timelines and len(timelines[key]) < per_event_limit:
+                    timelines[key].append(item)
+    except Exception:
+        return timelines
+    return timelines
 
 
 def get_history_events():
@@ -1551,21 +1578,35 @@ def collapse_nhc_storm_products(df):
 @st.cache_data(ttl=300, show_spinner=True)
 def load_events():
     all_rows = []
-    for feed in FEEDS:
+    max_workers = min(10, len(FEEDS) + 1)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(fetch_feed, feed): feed for feed in FEEDS}
+        calfire_future = executor.submit(fetch_calfire)
+        for future in as_completed(future_map):
+            feed = future_map[future]
+            try:
+                all_rows.extend(future.result())
+            except Exception as exc:
+                all_rows.append({
+                    "source": feed["source"], "feed": feed["name"], "url": feed["url"],
+                    "raw_title": "Feed error", "title": f"{feed['name']} unavailable",
+                    "summary": str(exc), "link": feed["url"], "published_utc": None,
+                    "published": "Unknown", "age": "Unknown",
+                    "peril": feed["default_peril"] if feed["default_peril"] != "All" else "Other",
+                    "alert_level": "Unknown", "magnitude": None, "wind_kmh": None,
+                    "lat": None, "lon": None, "tier": "Info",
+                })
         try:
-            all_rows.extend(fetch_feed(feed))
+            all_rows.extend(calfire_future.result())
         except Exception as exc:
             all_rows.append({
-                "source": feed["source"], "feed": feed["name"], "url": feed["url"],
-                "raw_title": "Feed error", "title": f"{feed['name']} unavailable",
-                "summary": str(exc), "link": feed["url"], "published_utc": None,
-                "published": "Unknown", "age": "Unknown",
-                "peril": feed["default_peril"] if feed["default_peril"] != "All" else "Other",
-                "alert_level": "Unknown", "magnitude": None, "wind_kmh": None,
-                "lat": None, "lon": None, "tier": "Info",
+                "source": "CAL FIRE", "feed": "CAL FIRE Incidents", "url": CALFIRE_URL,
+                "raw_title": "CAL FIRE feed unavailable", "title": "Wildfire: CAL FIRE feed unavailable",
+                "summary": str(exc), "link": "https://www.fire.ca.gov/incidents",
+                "published_utc": None, "published": "Unknown", "age": "Unknown",
+                "peril": "Wildfire", "alert_level": "Unknown", "magnitude": None,
+                "wind_kmh": None, "lat": None, "lon": None, "tier": "Info",
             })
-    all_rows.extend(fetch_calfire())
-
     df = pd.DataFrame(all_rows)
     if df.empty:
         return df
@@ -1819,7 +1860,7 @@ def render_desktop_alerts(new_major_df, enabled):
     components.html(html, height=48)
 
 
-def render_event_card(row, news_sources, new_ids, ns="", compact=False):
+def render_event_card(row, news_sources, new_ids, timeline_lookup=None, ns="", compact=False):
     is_new = row.get("event_id") in new_ids
     with st.container(border=True):
         c1, c2 = st.columns([0.78, 0.22])
@@ -1840,7 +1881,7 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
 
             has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
             event_key = str(row.get("event_id") or tracking_key(row))
-            timeline = get_event_timeline(event_key, limit=100)
+            timeline = (timeline_lookup or {}).get(event_key, [])
             update_count = timeline_update_count(timeline)
             if update_count:
                 update_label = "change" if update_count == 1 else "changes"
@@ -1851,18 +1892,25 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
             ncol, mcol = st.columns(2)
             with ncol:
                 with st.expander("\U0001F4F0 Related news"):
-                    query = news_query_from_row(row)
-                    st.caption(f"Searching news for: **{query}**")
-                    items = fetch_news(query, tuple(news_sources))
-                    if not items:
-                        st.info("No related news found for this event yet.")
-                    for it in items:
-                        meta = " \u00B7 ".join(x for x in [it.get("source", ""), it.get("age", "")] if x)
-                        st.markdown(
-                            f"- [{it['title']}]({it['link']})  \n"
-                            f"<span style='color:#8A94A6;font-size:0.8em'>{meta}</span>",
-                            unsafe_allow_html=True,
-                        )
+                    news_key = f"news_{ns}_{event_key}"
+                    loaded_news = st.session_state.setdefault("loaded_news", set())
+                    if st.button("Load related news", key=f"load_{news_key}", use_container_width=True):
+                        loaded_news.add(news_key)
+                    if news_key in loaded_news:
+                        query = news_query_from_row(row)
+                        st.caption(f"Searching news for: **{query}**")
+                        items = fetch_news(query, tuple(news_sources))
+                        if not items:
+                            st.info("No related news found for this event yet.")
+                        for it in items:
+                            meta = " \u00B7 ".join(x for x in [it.get("source", ""), it.get("age", "")] if x)
+                            st.markdown(
+                                f"- [{it['title']}]({it['link']})  \n"
+                                f"<span style='color:#8A94A6;font-size:0.8em'>{meta}</span>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("News is loaded only when requested.")
             with mcol:
                 with st.expander("\U0001F4CD Locate"):
                     if has_coords:
@@ -1895,7 +1943,7 @@ def render_event_card(row, news_sources, new_ids, ns="", compact=False):
                 st.link_button("Open source", row["link"], use_container_width=True)
 
 
-def render_cards(df, news_sources, new_ids, ns="", limit=50, compact=False):
+def render_cards(df, news_sources, new_ids, timeline_lookup=None, ns="", limit=50, compact=False):
     if df.empty:
         st.info("No events match the selected filters.")
         return
@@ -1915,7 +1963,7 @@ def render_cards(df, news_sources, new_ids, ns="", limit=50, compact=False):
     )
 
     for _, row in display_df.head(limit).iterrows():
-        render_event_card(row, news_sources, new_ids, ns=ns, compact=compact)
+        render_event_card(row, news_sources, new_ids, timeline_lookup=timeline_lookup, ns=ns, compact=compact)
 
 
 def render_summary(df, new_count):
@@ -2074,8 +2122,8 @@ def app():
     history_write_status = ""
     if not df.empty:
         df = material_changes(df, refresh_token)
-        if supabase_health_check()[0]:
-            df, history_write_status = persist_event_history(df)
+        if supabase_ok:
+            df, history_write_status = persist_event_history(df, client=supabase_client())
 
     if df.empty:
         st.error("No feed items loaded. Check connectivity or source availability.")
@@ -2085,6 +2133,8 @@ def app():
     new_ids = update_new_ids(set(df["event_id"]), refresh_token)
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
     new_visible = len(set(filtered["event_id"]) & new_ids) if not filtered.empty else 0
+    visible_event_keys = filtered["event_id"].astype(str).unique().tolist() if not filtered.empty else []
+    timeline_lookup = get_timelines_for_events(visible_event_keys, client=supabase_client()) if supabase_ok else {}
 
     major = filtered[filtered["tier"].isin(["Critical", "Watch"])].copy()
     major["_major_tier_rank"] = major["tier"].map({"Critical": 0, "Watch": 1}).fillna(9)
@@ -2154,6 +2204,7 @@ def app():
                         view_df,
                         news_sources,
                         new_ids,
+                        timeline_lookup=timeline_lookup,
                         ns=namespace,
                         compact=compact,
                     )
