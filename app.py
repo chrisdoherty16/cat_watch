@@ -1120,10 +1120,17 @@ def build_change_records(previous, current, peril=""):
     changes = []
     handled_fields = set()
     if is_tc:
-        # The richer TC headline records replace the flat status/forecast diffs;
-        # wind, pressure and movement stay below as supplemental detail.
+        # The richer TC headline records carry the material story: lifecycle
+        # stage, Saffir-Simpson category, forecast target and track. Wind,
+        # pressure, movement and advisory numbers are supplemental and are
+        # deliberately suppressed from the timeline so the progression stays
+        # uncluttered. They remain visible on the card's status panel and in the
+        # raw source observations, so nothing is lost, just de-emphasised.
         changes.extend(tc_change_records(previous, current))
-        handled_fields = {"status", "forecast_status"}
+        handled_fields = {
+            "status", "forecast_status", "wind_kmh", "pressure_mb",
+            "move_direction", "move_kmh", "advisory_number",
+        }
     for field in HISTORY_FIELDS:
         old = previous.get(field)
         new = current.get(field)
@@ -1362,6 +1369,38 @@ def get_timelines_for_events(event_keys, client=None, per_event_limit=100):
     return timelines
 
 
+def get_observations_for_events(event_keys, client=None, per_event_limit=200):
+    """Batch-load raw observations for visible events so each card's timeline can
+    be recomputed from stored source state instead of the frozen changes table.
+    Recomputing means the latest materiality rules apply to all history."""
+    client = client or supabase_client()
+    result = {str(key): [] for key in event_keys}
+    if client is None or not result:
+        return result
+    fields = (
+        "event_key,detected_at,source_updated_at,status,forecast_status,"
+        "wind_kmh,pressure_mb,formation_chance,movement_direction,movement_kmh,"
+        "latitude,longitude,magnitude,acres,contained_pct,alert_level,tier,"
+        "advisory_number,raw_title,raw_summary"
+    )
+    try:
+        for keys in chunked(result.keys(), 100):
+            response = (
+                client.table("observations").select(fields)
+                .in_("event_key", keys)
+                .order("source_updated_at", desc=True)
+                .order("detected_at", desc=True)
+                .limit(20000).execute()
+            )
+            for item in response.data or []:
+                key = str(item.get("event_key"))
+                if key in result and len(result[key]) < per_event_limit:
+                    result[key].append(item)
+    except Exception:
+        return result
+    return result
+
+
 def get_history_events():
     client = supabase_client()
     if client is None:
@@ -1404,22 +1443,51 @@ def timeline_timestamp(item):
     return parsed.strftime("%d %b %Y · %H:%M UTC") if parsed else "Time unavailable"
 
 
-def render_event_timeline(event_key, compact=True):
-    all_changes = get_event_timeline(event_key, limit=100)
-    changes = genuine_timeline_changes(all_changes)
-    if not changes:
-        st.caption("No changes recorded since first observed.")
+def compute_observation_timeline(observations, peril=""):
+    """Rebuild the change timeline from stored observations using the current
+    materiality rules, so historical entries reflect the latest logic (e.g. TC
+    lifecycle headlines and noise suppression) rather than whatever text was
+    frozen when the change was first written. Returns newest-first entries."""
+    if not observations:
+        return []
+    # ISO timestamps sort chronologically as plain strings.
+    ordered = sorted(
+        observations,
+        key=lambda o: (o.get("source_updated_at") or o.get("detected_at") or ""),
+    )
+    entries = []
+    prev_state = None
+    for obs in ordered:
+        state = prior_state_from_observation(obs)
+        records = build_change_records(prev_state, state, peril=peril)
+        texts = [
+            text for field, _old, _new, text in records
+            if field not in {"first_observed", "initial_state", "source_text"}
+        ]
+        if texts:
+            entries.append({
+                "source_time": obs.get("source_updated_at") or obs.get("detected_at"),
+                "detected_time": obs.get("detected_at"),
+                "changes": texts,
+            })
+        prev_state = state
+    entries.reverse()
+    return entries
+
+
+def render_event_timeline(event_key, peril="", observations=None, compact=True):
+    if observations is None:
+        observations = get_event_observations(event_key, limit=200)
+    entries = compute_observation_timeline(observations, peril=peril)
+    if not entries:
+        st.caption("No material changes recorded since first observed.")
         return
-    grouped = {}
-    for item in changes:
-        observation_id = item.get("observation_id")
-        grouped.setdefault(observation_id, []).append(item)
-    for items in grouped.values():
-        st.markdown(f"**{timeline_timestamp(items[0])}**")
-        for item in items:
-            st.markdown(f"- {item.get('change_text', 'Update recorded')}")
-        detected = parse_dt(items[0].get("detected_at"))
-        source_time = parse_dt(items[0].get("source_updated_at"))
+    for entry in entries:
+        st.markdown(f"**{timeline_timestamp({'source_updated_at': entry['source_time']})}**")
+        for text in entry["changes"]:
+            st.markdown(f"- {text}")
+        detected = parse_dt(entry["detected_time"])
+        source_time = parse_dt(entry["source_time"])
         if detected and source_time and abs((detected - source_time).total_seconds()) >= 60:
             st.caption(f"Detected by CatWatch: {detected.strftime('%d %b %Y · %H:%M UTC')}")
 
@@ -1458,7 +1526,7 @@ def render_history_tab():
     selected = view[view["event_key"] == event_key].iloc[0]
     st.markdown(f"### {selected['display_name']}")
     st.caption(f"{selected['peril']} · {selected['source']} · Event key: {event_key}")
-    observations = get_event_observations(event_key)
+    observations = get_event_observations(event_key, limit=200)
     if observations:
         latest = observations[0]
         metrics = []
@@ -1471,7 +1539,7 @@ def render_history_tab():
             for index, (label, value) in enumerate(metrics):
                 columns[index % len(columns)].metric(label, value)
     st.markdown("#### Timeline")
-    render_event_timeline(event_key, compact=False)
+    render_event_timeline(event_key, peril=selected.get("peril", ""), observations=observations, compact=False)
     if observations:
         with st.expander("Original source updates"):
             for observation in observations:
@@ -2093,7 +2161,7 @@ def render_desktop_alerts(new_major_df, enabled):
     components.html(html, height=48)
 
 
-def render_event_card(row, news_sources, new_ids, timeline_lookup=None, ns="", compact=False):
+def render_event_card(row, news_sources, new_ids, observations_lookup=None, ns="", compact=False):
     is_new = row.get("event_id") in new_ids
     with st.container(border=True):
         c1, c2 = st.columns([0.78, 0.22])
@@ -2114,14 +2182,20 @@ def render_event_card(row, news_sources, new_ids, timeline_lookup=None, ns="", c
 
             has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
             event_key = str(row.get("event_id") or tracking_key(row))
-            timeline = (timeline_lookup or {}).get(event_key, [])
-            update_count = timeline_update_count(timeline)
+            observations = (observations_lookup or {}).get(event_key)
+            if observations is None:
+                observations = get_event_observations(event_key, limit=200)
+            event_peril = row.get("peril", "")
+            timeline_entries = compute_observation_timeline(observations, peril=event_peril)
+            update_count = len(timeline_entries)
             if update_count:
                 update_label = "change" if update_count == 1 else "changes"
                 with st.expander(f"Change history ({update_count} {update_label})"):
-                    render_event_timeline(event_key, compact=True)
+                    render_event_timeline(
+                        event_key, peril=event_peril, observations=observations, compact=True
+                    )
             else:
-                st.caption("No changes recorded since first observed.")
+                st.caption("No material changes recorded since first observed.")
             ncol, mcol = st.columns(2)
             with ncol:
                 with st.expander("\U0001F4F0 Related news"):
@@ -2176,7 +2250,7 @@ def render_event_card(row, news_sources, new_ids, timeline_lookup=None, ns="", c
                 st.link_button("Open source", row["link"], use_container_width=True)
 
 
-def render_cards(df, news_sources, new_ids, timeline_lookup=None, ns="", limit=50, compact=False):
+def render_cards(df, news_sources, new_ids, observations_lookup=None, ns="", limit=50, compact=False):
     if df.empty:
         st.info("No events match the selected filters.")
         return
@@ -2196,7 +2270,7 @@ def render_cards(df, news_sources, new_ids, timeline_lookup=None, ns="", limit=5
     )
 
     for _, row in display_df.head(limit).iterrows():
-        render_event_card(row, news_sources, new_ids, timeline_lookup=timeline_lookup, ns=ns, compact=compact)
+        render_event_card(row, news_sources, new_ids, observations_lookup=observations_lookup, ns=ns, compact=compact)
 
 
 def render_summary(df, new_count):
@@ -2367,7 +2441,7 @@ def app():
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
     new_visible = len(set(filtered["event_id"]) & new_ids) if not filtered.empty else 0
     visible_event_keys = filtered["event_id"].astype(str).unique().tolist() if not filtered.empty else []
-    timeline_lookup = get_timelines_for_events(visible_event_keys, client=supabase_client()) if supabase_ok else {}
+    observations_lookup = get_observations_for_events(visible_event_keys, client=supabase_client()) if supabase_ok else {}
 
     major = filtered[filtered["tier"].isin(["Critical", "Watch"])].copy()
     major["_major_tier_rank"] = major["tier"].map({"Critical": 0, "Watch": 1}).fillna(9)
@@ -2437,7 +2511,7 @@ def app():
                         view_df,
                         news_sources,
                         new_ids,
-                        timeline_lookup=timeline_lookup,
+                        observations_lookup=observations_lookup,
                         ns=namespace,
                         compact=compact,
                     )
