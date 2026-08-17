@@ -398,6 +398,32 @@ def nhc_active_storm_key(row):
         return f"ATCF|{atcf_id.upper()}"
     return ""
 
+
+def cross_source_tc_key(row):
+    """Source-agnostic identity for a named tropical cyclone.
+
+    Lets a storm tracked by both NHC and GDACS collapse to a single card. Uses
+    the storm name shared across providers (e.g. NHC "Hurricane Kiko" and GDACS
+    "tropical cyclone KIKO-25"). Invests/basin codes and unnamed systems return
+    an empty string so they are never merged across sources, which keeps NW
+    Pacific typhoons that only GDACS carries intact.
+    """
+    if row.get("peril") != "Tropical Cyclone":
+        return ""
+    raw_title = clean_optional_text(row.get("raw_title"))
+    summary = clean_optional_text(row.get("summary"))
+    if is_outlook(raw_title, summary):
+        return ""
+    name = extract_nhc_storm_name(raw_title, summary) or extract_tc_identity(raw_title, summary)
+    name = re.sub(r"-\d+$", "", name or "").strip()  # strip GDACS year suffix, KIKO-25 -> KIKO
+    if not name:
+        return ""
+    # Exclude invest/basin codes such as EP91 or AL93 which are not shared names.
+    if re.fullmatch(r"[A-Z]{2}9\d", name.upper()):
+        return ""
+    return f"TCNAME|{name.casefold()}"
+
+
 def extract_atcf_id(text):
     """Extract an ATCF identifier such as AL032026 from text or a URL."""
     m = re.search(r"\b([A-Z]{2}\d{2}\d{4})\b", text or "", flags=re.IGNORECASE)
@@ -904,19 +930,206 @@ def initial_state_text(current):
     return " · ".join(parts[:6])
 
 
-def build_change_records(previous, current):
+# --- Tropical cyclone materiality -------------------------------------------
+# The timeline for a storm should read the way an underwriter would summarise
+# it verbally: lifecycle stage first, then intensity (Saffir-Simpson), then the
+# forecast track/landfall. Wind, pressure and movement remain as supplemental
+# detail beneath the headline. All values below are derived from fields already
+# stored (wind_kmh, status, forecast_status, summary), so no schema change is
+# required and existing observations stay compatible.
+
+# Saffir-Simpson thresholds expressed in km/h (converted from the 64/83/96/113/
+# 137 kt category boundaries).
+SAFFIR_SIMPSON_KMH = [(252, 5), (209, 4), (178, 3), (154, 2), (119, 1)]
+
+TC_STATUS_RANK = {
+    "Post-Tropical Cyclone": -1,
+    "Invest": 0,
+    "Potential Tropical Cyclone": 1,
+    "Tropical Depression": 2,
+    "Tropical Storm": 3,
+    "Hurricane": 4,
+    "Typhoon": 4,
+    "Major Hurricane": 5,
+}
+
+TC_STATUS_ABBR = {
+    "Invest": "Invest",
+    "Potential Tropical Cyclone": "PTC",
+    "Tropical Depression": "TD",
+    "Tropical Storm": "TS",
+    "Hurricane": "Hurricane",
+    "Typhoon": "Typhoon",
+    "Major Hurricane": "Major Hurricane",
+    "Post-Tropical Cyclone": "Post-Tropical",
+}
+
+
+def saffir_simpson_category(wind_kmh):
+    """Return the Saffir-Simpson category (1-5) for a wind speed, else None."""
+    try:
+        if wind_kmh is None or pd.isna(wind_kmh):
+            return None
+        wind = float(wind_kmh)
+    except (TypeError, ValueError):
+        return None
+    for threshold, category in SAFFIR_SIMPSON_KMH:
+        if wind >= threshold:
+            return category
+    return None
+
+
+def tc_status_with_category(status, category):
+    """Render a status label, appending the category for hurricane-strength systems."""
+    abbr = TC_STATUS_ABBR.get(status, status)
+    if category and status in {"Hurricane", "Major Hurricane", "Typhoon"}:
+        return f"{abbr} (Cat {category})"
+    return abbr
+
+
+def extract_tc_threat(text):
+    """Best-effort forecast landfall/approach location from NHC advisory text."""
+    text = clean_optional_text(text)
+    if not text:
+        return ""
+    patterns = [
+        r"(?:hurricane|tropical storm|storm surge)\s+warning\s+is\s+in\s+effect\s+for\s+"
+        r"([A-Z][A-Za-z .'\-]+?)(?:\.|,|;| from | and | to |$)",
+        r"(?:forecast|expected)\s+to\s+(?:move\s+)?(?:near|over|across|toward|onto|into|inland over)\s+"
+        r"(?:or\s+(?:near|over)\s+)?(?:the\s+)?([A-Z][A-Za-z .'\-]+?)"
+        r"(?:\.|,|;| by | late | early | tonight | on | within | (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)|$)",
+        r"(?:approaching|nearing|move near)\s+(?:the\s+)?([A-Z][A-Za-z .'\-]+?)"
+        r"(?:\.|,|;| by | late | early | tonight | on | within |$)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            loc = _clean_location(m.group(1))
+            loc = re.sub(r"^(?:the|a|an)\s+", "", loc, flags=re.IGNORECASE).strip()
+            if 2 <= len(loc) <= 40:
+                return loc
+    return ""
+
+
+def extract_tc_timing(text):
+    """Best-effort forecast timing cue (hours, day, or relative term)."""
+    text = clean_optional_text(text)
+    if not text:
+        return ""
+    m = re.search(r"(?:within|in|over the next)\s+(?:the\s+next\s+)?(\d{1,3})\s*(?:to\s*\d{1,3}\s*)?hours",
+                  text, flags=re.IGNORECASE)
+    if m:
+        return f"~{m.group(1)}h"
+    m = re.search(r"\b(tonight|today|tomorrow|this evening|this morning|overnight)\b",
+                  text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"\b(?:by|on|late|early)\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+                  text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def tc_threat_text(summary):
+    """Combine forecast location and timing into a short track/landfall phrase."""
+    location = extract_tc_threat(summary)
+    if not location:
+        return ""
+    timing = extract_tc_timing(summary)
+    return f"{location} {timing}".strip() if timing else location
+
+
+def tc_change_records(previous, current):
+    """Peril-aware headline changes for a tropical cyclone, ordered by materiality."""
+    records = []
+    previous = previous or {}
+    prev_status = clean_optional_text(previous.get("status"))
+    cur_status = clean_optional_text(current.get("status"))
+    prev_cat = saffir_simpson_category(previous.get("wind_kmh"))
+    cur_cat = saffir_simpson_category(current.get("wind_kmh"))
+
+    # 1. Lifecycle stage transition (upgrade or downgrade), with category.
+    if prev_status and cur_status and prev_status != cur_status:
+        prev_rank = TC_STATUS_RANK.get(prev_status, 0)
+        cur_rank = TC_STATUS_RANK.get(cur_status, 0)
+        direction = "Upgraded" if cur_rank > prev_rank else "Downgraded"
+        records.append((
+            "lifecycle", prev_status, cur_status,
+            f"{direction} {TC_STATUS_ABBR.get(prev_status, prev_status)} \u2192 "
+            f"{tc_status_with_category(cur_status, cur_cat)}",
+        ))
+    # 2. Saffir-Simpson category shift while the status label is unchanged
+    #    (e.g. Cat 1 -> Cat 2, or Major Hurricane Cat 3 -> Cat 4).
+    elif cur_cat and prev_cat and cur_cat != prev_cat:
+        direction = "Intensified" if cur_cat > prev_cat else "Weakened"
+        records.append((
+            "category", f"Cat {prev_cat}", f"Cat {cur_cat}",
+            f"{direction} to Cat {cur_cat} (from Cat {prev_cat})",
+        ))
+
+    # 3. Forecast intensification target.
+    prev_fore = clean_optional_text(previous.get("forecast_status"))
+    cur_fore = clean_optional_text(current.get("forecast_status"))
+    if cur_fore and cur_fore != prev_fore:
+        records.append((
+            "forecast_status", prev_fore or None, cur_fore,
+            f"Now forecast to reach {cur_fore}",
+        ))
+
+    # 4. Forecast track / landfall threat.
+    prev_threat = tc_threat_text(previous.get("summary"))
+    cur_threat = tc_threat_text(current.get("summary"))
+    if cur_threat and cur_threat != prev_threat:
+        records.append((
+            "landfall", prev_threat or None, cur_threat,
+            f"Forecast track: {cur_threat}",
+        ))
+    return records
+
+
+def tc_initial_state_text(current):
+    """Underwriter-style baseline line for a newly observed tropical cyclone."""
+    parts = []
+    status = clean_optional_text(current.get("status"))
+    category = saffir_simpson_category(current.get("wind_kmh"))
+    if status:
+        parts.append(tc_status_with_category(status, category))
+    forecast = clean_optional_text(current.get("forecast_status"))
+    if forecast:
+        parts.append(f"forecast {forecast}")
+    threat = tc_threat_text(current.get("summary"))
+    if threat:
+        parts.append(f"track {threat}")
+    for field in ("wind_kmh", "pressure_mb", "formation_chance"):
+        value = current.get(field)
+        if value not in (None, ""):
+            parts.append(format_history_value(field, value))
+    return " \u00b7 ".join(parts[:6])
+
+
+def build_change_records(previous, current, peril=""):
+    is_tc = clean_optional_text(peril) == "Tropical Cyclone"
     if previous is None:
-        baseline = initial_state_text(current)
+        baseline = tc_initial_state_text(current) if is_tc else initial_state_text(current)
         changes = [("first_observed", None, None, "First observed by CatWatch")]
         if baseline:
             changes.append(("initial_state", None, None, f"Initial state: {baseline}"))
         return changes
 
     changes = []
+    handled_fields = set()
+    if is_tc:
+        # The richer TC headline records replace the flat status/forecast diffs;
+        # wind, pressure and movement stay below as supplemental detail.
+        changes.extend(tc_change_records(previous, current))
+        handled_fields = {"status", "forecast_status"}
     for field in HISTORY_FIELDS:
         old = previous.get(field)
         new = current.get(field)
         if old == new:
+            continue
+        if field in handled_fields:
             continue
         # Full source text and exact coordinates remain stored for audit. Source
         # wording alone is a genuine observation update, but it is not a user
@@ -1056,7 +1269,11 @@ def persist_event_history(df, client=None):
             if not inserted.data:
                 raise RuntimeError("Observation insert returned no record")
             observation_id = inserted.data[0]["observation_id"]
-            changes = build_change_records(prior_state_from_observation(prior), state)
+            changes = build_change_records(
+                prior_state_from_observation(prior),
+                state,
+                peril=clean_optional_text(row.get("peril")),
+            )
             payloads = [{
                 "event_key": event_key, "observation_id": observation_id,
                 "detected_at": detected_at, "source_updated_at": source_updated_at,
@@ -1628,8 +1845,24 @@ def load_events():
         return r["event_id"]
 
     df["dedup_key"] = df.apply(dedup_key, axis=1)
-    df = df.sort_values("published_sort", ascending=False, na_position="last")
+    # Cross-source cyclone identity: when a named storm appears from both NHC and
+    # GDACS, collapse them onto one shared key. Basin-only GDACS storms (e.g. NW
+    # Pacific typhoons NHC does not issue advisories for) yield no cross key and
+    # keep their own GDACS entry.
+    df["_tc_cross_key"] = df.apply(cross_source_tc_key, axis=1)
+    cross_mask = df["_tc_cross_key"].astype(str).ne("")
+    df.loc[cross_mask, "dedup_key"] = df.loc[cross_mask, "_tc_cross_key"]
+    # Prefer NHC over GDACS for shared storms; within a source, keep the most
+    # recent. CAL FIRE shares NHC's top priority as it never overlaps cyclones.
+    df["source_priority"] = df["source"].map({"NHC": 0, "CAL FIRE": 0, "GDACS": 1}).fillna(2)
+    df = df.sort_values(
+        ["source_priority", "published_sort"],
+        ascending=[True, False],
+        na_position="last",
+        kind="stable",
+    )
     df = df.drop_duplicates(subset=["dedup_key"], keep="first")
+    df = df.drop(columns=["_tc_cross_key"], errors="ignore")
     df = df.sort_values(["tier_rank", "alert_rank", "published_sort"], ascending=[True, True, False], na_position="last")
     return df.reset_index(drop=True)
 
