@@ -166,6 +166,62 @@ def age_label(dt):
     return f"{minutes}m ago"
 
 
+# --- Local time (Bermuda) formatting ----------------------------------------
+# The user is in Bermuda and prefers local time with AM/PM over UTC 24-hour.
+# Bermuda observes Atlantic Time: ADT (UTC-3) in summer, AST (UTC-4) in winter.
+# Prefer the tz database when available; otherwise fall back to US DST rules
+# (Bermuda follows the same second-Sunday-March to first-Sunday-November rule).
+try:
+    from zoneinfo import ZoneInfo
+    _BERMUDA_TZ = ZoneInfo("Atlantic/Bermuda")
+except Exception:
+    _BERMUDA_TZ = None
+
+
+def _us_dst_active(dt_utc):
+    """True if US/Bermuda daylight time is in effect for the given UTC datetime."""
+    year = dt_utc.year
+    march = datetime(year, 3, 8, tzinfo=timezone.utc)   # earliest 2nd Sunday
+    while march.weekday() != 6:                          # 6 == Sunday
+        march += timedelta(days=1)
+    nov = datetime(year, 11, 1, tzinfo=timezone.utc)     # earliest 1st Sunday
+    while nov.weekday() != 6:
+        nov += timedelta(days=1)
+    return march <= dt_utc < nov
+
+
+def _coerce_utc_dt(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if hasattr(value, "to_pydatetime"):
+        try:
+            dt = value.to_pydatetime()
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return parse_dt(str(value))
+
+
+def format_local_time(value, with_date=True):
+    """Format a UTC time as Bermuda local time, e.g. '17 Aug 2026 · 8:41 AM ADT'."""
+    dt = _coerce_utc_dt(value)
+    if dt is None:
+        return "Time unavailable"
+    if _BERMUDA_TZ is not None:
+        local = dt.astimezone(_BERMUDA_TZ)
+        abbr = local.tzname() or "AST"
+    else:
+        dst = _us_dst_active(dt.astimezone(timezone.utc))
+        local = dt.astimezone(timezone(timedelta(hours=-3 if dst else -4)))
+        abbr = "ADT" if dst else "AST"
+    hour12 = local.hour % 12 or 12
+    ampm = "AM" if local.hour < 12 else "PM"
+    clock = f"{hour12}:{local.minute:02d} {ampm} {abbr}"
+    return f"{local.day} {local.strftime('%b %Y')} · {clock}" if with_date else clock
+
+
 def is_outlook(raw_title, summary):
     text = f"{raw_title} {summary}".lower()
     return ("tropical weather outlook" in text) or raw_title.strip().lower() == "tropical cyclone center"
@@ -665,8 +721,13 @@ def fetch_feed(feed):
         lat, lon = extract_latlon(entry)
         link = entry.get("link", feed["url"])
         atcf_id = extract_atcf_id(f"{combo} {link}")
-        status = extract_current_storm_status(raw_title, summary) if peril == "Tropical Cyclone" else ""
-        forecast_status = extract_forecast_status(combo) if peril == "Tropical Cyclone" else ""
+        # A Tropical Weather Outlook is a basin summary, not a storm, so it must
+        # never carry a lifecycle status. Its prose mentions "National Hurricane
+        # Center" and other systems, which would otherwise be misread as the
+        # outlook itself being a hurricane.
+        is_named_tc_row = peril == "Tropical Cyclone" and not is_outlook(raw_title, summary)
+        status = extract_current_storm_status(raw_title, summary) if is_named_tc_row else ""
+        forecast_status = extract_forecast_status(combo) if is_named_tc_row else ""
         pressure_mb = extract_pressure_mb(combo)
         advisory_number = extract_advisory_number(combo)
         move_direction, move_kmh = extract_movement(combo)
@@ -1109,7 +1170,13 @@ def tc_initial_state_text(current):
 
 
 def build_change_records(previous, current, peril=""):
-    is_tc = clean_optional_text(peril) == "Tropical Cyclone"
+    # Outlooks are basin summaries; never treat them as a lifecycle-bearing storm,
+    # and suppress any status/forecast that leaked in from earlier stored records.
+    is_outlook_row = is_outlook(
+        clean_optional_text(current.get("raw_title")),
+        clean_optional_text(current.get("summary")),
+    )
+    is_tc = clean_optional_text(peril) == "Tropical Cyclone" and not is_outlook_row
     if previous is None:
         baseline = tc_initial_state_text(current) if is_tc else initial_state_text(current)
         changes = [("first_observed", None, None, "First observed by CatWatch")]
@@ -1131,6 +1198,10 @@ def build_change_records(previous, current, peril=""):
             "status", "forecast_status", "wind_kmh", "pressure_mb",
             "move_direction", "move_kmh", "advisory_number",
         }
+    elif is_outlook_row:
+        # Suppress bogus lifecycle diffs (e.g. "Post-Tropical -> Hurricane")
+        # that were mis-extracted from outlook prose in earlier observations.
+        handled_fields = {"status", "forecast_status"}
     for field in HISTORY_FIELDS:
         old = previous.get(field)
         new = current.get(field)
@@ -1439,8 +1510,7 @@ def get_event_observations(event_key, limit=100):
 
 def timeline_timestamp(item):
     value = item.get("source_updated_at") or item.get("detected_at")
-    parsed = parse_dt(value)
-    return parsed.strftime("%d %b %Y · %H:%M UTC") if parsed else "Time unavailable"
+    return format_local_time(value)
 
 
 def compute_observation_timeline(observations, peril=""):
@@ -1489,7 +1559,7 @@ def render_event_timeline(event_key, peril="", observations=None, compact=True):
         detected = parse_dt(entry["detected_time"])
         source_time = parse_dt(entry["source_time"])
         if detected and source_time and abs((detected - source_time).total_seconds()) >= 60:
-            st.caption(f"Detected by CatWatch: {detected.strftime('%d %b %Y · %H:%M UTC')}")
+            st.caption(f"Detected by CatWatch: {format_local_time(detected)}")
 
 def render_history_tab():
     st.subheader("Event History")
@@ -2227,7 +2297,7 @@ def render_event_card(row, news_sources, new_ids, observations_lookup=None, ns="
                     st.link_button("Open in Google Maps", maps_url(row), use_container_width=True)
         with c2:
             st.metric("Updated", row["age"])
-            st.caption(f"Published: {row['published']}")
+            st.caption(f"Published: {format_local_time(row.get('published_utc'))}")
             if row["alert_level"] != "Unknown":
                 st.caption(f"Alert: {row['alert_level']}")
             if pd.notna(row.get("magnitude")):
