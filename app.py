@@ -2010,10 +2010,26 @@ def collapse_nhc_storm_products(df):
             for value in g.get("forecast_status", pd.Series(dtype=str)).tolist()
             if clean_optional_text(value)
         ]
-        best["forecast_status"] = (
+        chosen_forecast = (
             max(forecast_statuses, key=lambda value: status_rank.get(value, -1))
             if forecast_statuses else ""
         )
+        best["forecast_status"] = chosen_forecast
+        # The forecast timing ("by Wednesday") is extracted per product but must
+        # survive the collapse: pair it with the product that carried the chosen
+        # forecast status, falling back to any non-empty timing in the group.
+        timing_value = ""
+        if "forecast_status" in g.columns and "forecast_timing" in g.columns:
+            for fs, ft in zip(g["forecast_status"].tolist(), g["forecast_timing"].tolist()):
+                if clean_optional_text(fs) == chosen_forecast and clean_optional_text(ft):
+                    timing_value = clean_optional_text(ft)
+                    break
+        if not timing_value and "forecast_timing" in g.columns:
+            for ft in g["forecast_timing"].tolist():
+                if clean_optional_text(ft):
+                    timing_value = clean_optional_text(ft)
+                    break
+        best["forecast_timing"] = timing_value
         products = [p for p in g.get("product_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if p]
         best["source_product_count"] = int(len(g))
         best["source_products"] = ", ".join(products)
@@ -2572,8 +2588,19 @@ def app():
         alert_material = st.checkbox("Material status and metric changes", value=True, disabled=not desktop_alerts)
         alert_major = st.checkbox("New Critical/Watch events", value=True, disabled=not desktop_alerts)
         st.divider()
-        time_window = st.selectbox("Time window", ["24 hours", "7 days", "30 days", "All available"], index=1)
-        hours_lookup = {"24 hours": 24, "7 days": 168, "30 days": 720, "All available": None}
+        time_window = st.selectbox(
+            "Show events updated within",
+            ["24 hours", "2 days", "7 days", "30 days", "All available"],
+            index=1,
+            help=(
+                "Filters on each event's most recent update. Active systems that "
+                "keep issuing advisories stay visible; a storm that has gone "
+                "silent (e.g. dissipated) drops off once it passes this threshold. "
+                "NHC/CPHC issue advisories roughly every 6 hours for active "
+                "cyclones, so a 2-day silence usually means it is no longer active."
+            ),
+        )
+        hours_lookup = {"24 hours": 24, "2 days": 48, "7 days": 168, "30 days": 720, "All available": None}
         min_tier = st.selectbox("Minimum tier", ["Critical", "Watch", "Advisory", "Info"], index=2)
         perils = st.multiselect("Perils", PERIL_ORDER, default=PERIL_ORDER)
         sources = st.multiselect("Sources", ["GDACS", "NHC", "CAL FIRE"], default=["GDACS", "NHC", "CAL FIRE"])
