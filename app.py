@@ -381,58 +381,6 @@ def extract_forecast_status(text):
     return ""
 
 
-def hurricane_category(wind_kmh):
-    try:
-        wind = float(wind_kmh)
-    except (TypeError, ValueError):
-        return None
-    for category, threshold in ((5, 252), (4, 209), (3, 178), (2, 154), (1, 119)):
-        if wind >= threshold:
-            return category
-    return None
-
-
-def cyclone_stage(status, wind_kmh=None):
-    category = hurricane_category(wind_kmh)
-    if category:
-        return f"Category {category} Hurricane"
-    return clean_optional_text(status)
-
-
-def cyclone_stage_rank(stage):
-    if not stage:
-        return None
-    match = re.search(r"Category\s+([1-5])", str(stage), flags=re.IGNORECASE)
-    if match:
-        return 4 + int(match.group(1))
-    return {
-        "Invest": 0, "Potential Tropical Cyclone": 1, "Tropical Depression": 2,
-        "Tropical Storm": 3, "Hurricane": 5, "Major Hurricane": 7,
-        "Post-Tropical Cyclone": -1,
-    }.get(str(stage))
-
-
-def extract_forecast_category(text):
-    text = clean_optional_text(text)
-    for category in (5, 4, 3, 2, 1):
-        words = {5: "five", 4: "four", 3: "three", 2: "two", 1: "one"}[category]
-        pattern = rf"(?:forecast|expected|likely).{{0,60}}category\s*(?:{category}|{words})"
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return f"Category {category} Hurricane"
-    if re.search(r"(?:forecast|expected|likely).{0,60}major hurricane", text, flags=re.IGNORECASE):
-        return "Major Hurricane"
-    return ""
-
-
-def crossed_formation_threshold(old, new):
-    try:
-        old_value, new_value = float(old), float(new)
-    except (TypeError, ValueError):
-        return None
-    crossed = [value for value in (40, 70, 90) if old_value < value <= new_value]
-    return max(crossed) if crossed else None
-
-
 def nhc_active_storm_key(row):
     if row.get("source") != "NHC" or row.get("peril") != "Tropical Cyclone":
         return ""
@@ -692,9 +640,7 @@ def fetch_feed(feed):
         link = entry.get("link", feed["url"])
         atcf_id = extract_atcf_id(f"{combo} {link}")
         status = extract_current_storm_status(raw_title, summary) if peril == "Tropical Cyclone" else ""
-        forecast_status = ""
-        if peril == "Tropical Cyclone":
-            forecast_status = extract_forecast_category(combo) or extract_forecast_status(combo)
+        forecast_status = extract_forecast_status(combo) if peril == "Tropical Cyclone" else ""
         pressure_mb = extract_pressure_mb(combo)
         advisory_number = extract_advisory_number(combo)
         move_direction, move_kmh = extract_movement(combo)
@@ -958,7 +904,7 @@ def initial_state_text(current):
     return " · ".join(parts[:6])
 
 
-def build_change_records(previous, current, peril=None):
+def build_change_records(previous, current):
     if previous is None:
         baseline = initial_state_text(current)
         changes = [("first_observed", None, None, "First observed by CatWatch")]
@@ -966,46 +912,25 @@ def build_change_records(previous, current, peril=None):
             changes.append(("initial_state", None, None, f"Initial state: {baseline}"))
         return changes
 
-    if peril == "Tropical Cyclone":
-        changes = []
-        old_stage = cyclone_stage(previous.get("status"), previous.get("wind_kmh"))
-        new_stage = cyclone_stage(current.get("status"), current.get("wind_kmh"))
-        if old_stage and new_stage and old_stage != new_stage:
-            old_rank, new_rank = cyclone_stage_rank(old_stage), cyclone_stage_rank(new_stage)
-            if new_stage == "Post-Tropical Cyclone":
-                text = f"Transitioned to post-tropical cyclone from {old_stage}"
-            elif old_rank is not None and new_rank is not None and new_rank > old_rank:
-                text = f"Upgraded: {old_stage} → {new_stage}"
-            elif old_rank is not None and new_rank is not None and new_rank < old_rank:
-                text = f"Downgraded: {old_stage} → {new_stage}"
-            else:
-                text = f"Status: {old_stage} → {new_stage}"
-            changes.append(("cyclone_stage", old_stage, new_stage, text))
-
-        old_forecast = clean_optional_text(previous.get("forecast_status"))
-        new_forecast = clean_optional_text(current.get("forecast_status"))
-        if new_forecast and old_forecast != new_forecast:
-            changes.append((
-                "forecast_status", old_forecast or None, new_forecast,
-                f"Forecast intensity: {old_forecast or 'No material forecast'} → {new_forecast}",
-            ))
-
-        threshold = crossed_formation_threshold(previous.get("formation_chance"), current.get("formation_chance"))
-        if threshold:
-            changes.append((
-                "formation_milestone", previous.get("formation_chance"), current.get("formation_chance"),
-                f"Formation chance reached {threshold}%",
-            ))
-        return changes
-
     changes = []
     for field in HISTORY_FIELDS:
-        old, new = previous.get(field), current.get(field)
-        if old == new or field in {"raw_title", "summary", "lat", "lon"}:
+        old = previous.get(field)
+        new = current.get(field)
+        if old == new:
             continue
+        # Full source text and exact coordinates remain stored for audit. Source
+        # wording alone is a genuine observation update, but it is not a user
+        # notification unless another tracked event field also changed.
+        if field in {"raw_title", "summary"}:
+            continue
+        # Small coordinate movements create noise and are retained only in the
+        # underlying observation record.
+        if field in {"lat", "lon"}:
+            continue
+        label = HISTORY_LABELS[field]
         changes.append((
             field, old, new,
-            f"{HISTORY_LABELS[field]}: {format_history_value(field, old)} → {format_history_value(field, new)}",
+            f"{label}: {format_history_value(field, old)} → {format_history_value(field, new)}",
         ))
     raw_changed = any(previous.get(field) != current.get(field) for field in ("raw_title", "summary"))
     if raw_changed and not changes:
@@ -1131,7 +1056,7 @@ def persist_event_history(df, client=None):
             if not inserted.data:
                 raise RuntimeError("Observation insert returned no record")
             observation_id = inserted.data[0]["observation_id"]
-            changes = build_change_records(prior_state_from_observation(prior), state, peril=row.get("peril"))
+            changes = build_change_records(prior_state_from_observation(prior), state)
             payloads = [{
                 "event_key": event_key, "observation_id": observation_id,
                 "detected_at": detected_at, "source_updated_at": source_updated_at,
@@ -1142,11 +1067,7 @@ def persist_event_history(df, client=None):
             } for field, old, new, text in changes]
             if payloads:
                 client.table("changes").insert(payloads).execute()
-            notification_changes = [
-                item[3] for item in changes
-                if item[0] not in {"source_text", "first_observed", "initial_state"}
-            ]
-            row_changes.append(notification_changes)
+            row_changes.append([item[3] for item in changes if item[0] != "source_text"])
         except Exception as exc:
             failures.append(f"{event_key}: {str(exc)[:120]}")
             row_changes.append([])
@@ -1179,25 +1100,25 @@ def get_event_timeline(event_key, limit=25):
 NON_CHANGE_FIELDS = {"first_observed", "initial_state", "source_text"}
 
 
-def genuine_timeline_changes(changes, peril=None):
-    baseline_ids = {
-        item.get("observation_id") for item in changes
+def genuine_timeline_changes(changes):
+    """Exclude the entire baseline observation, including legacy baseline fields."""
+    baseline_observation_ids = {
+        item.get("observation_id")
+        for item in changes
         if item.get("field_name") in {"first_observed", "initial_state"}
+        and item.get("observation_id") is not None
     }
-    filtered = [
+    return [
         item for item in changes
         if item.get("field_name") not in NON_CHANGE_FIELDS
-        and item.get("observation_id") not in baseline_ids
+        and item.get("observation_id") not in baseline_observation_ids
     ]
-    if peril == "Tropical Cyclone":
-        allowed = {"cyclone_stage", "forecast_status", "formation_milestone"}
-        filtered = [item for item in filtered if item.get("field_name") in allowed]
-    return filtered
 
 
-def timeline_update_count(changes, peril=None):
-    genuine = genuine_timeline_changes(changes, peril=peril)
+def timeline_update_count(changes):
+    genuine = genuine_timeline_changes(changes)
     return len({item.get("observation_id") for item in genuine if item.get("observation_id") is not None})
+
 
 def get_timelines_for_events(event_keys, client=None, per_event_limit=100):
     """Load all visible card timelines in a few requests and group them locally."""
@@ -1266,9 +1187,9 @@ def timeline_timestamp(item):
     return parsed.strftime("%d %b %Y · %H:%M UTC") if parsed else "Time unavailable"
 
 
-def render_event_timeline(event_key, compact=True, peril=None):
+def render_event_timeline(event_key, compact=True):
     all_changes = get_event_timeline(event_key, limit=100)
-    changes = genuine_timeline_changes(all_changes, peril=peril)
+    changes = genuine_timeline_changes(all_changes)
     if not changes:
         st.caption("No changes recorded since first observed.")
         return
@@ -1333,7 +1254,7 @@ def render_history_tab():
             for index, (label, value) in enumerate(metrics):
                 columns[index % len(columns)].metric(label, value)
     st.markdown("#### Timeline")
-    render_event_timeline(event_key, compact=False, peril=selected.get("peril"))
+    render_event_timeline(event_key, compact=False)
     if observations:
         with st.expander("Original source updates"):
             for observation in observations:
@@ -1961,11 +1882,11 @@ def render_event_card(row, news_sources, new_ids, timeline_lookup=None, ns="", c
             has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
             event_key = str(row.get("event_id") or tracking_key(row))
             timeline = (timeline_lookup or {}).get(event_key, [])
-            update_count = timeline_update_count(timeline, peril=row.get("peril"))
+            update_count = timeline_update_count(timeline)
             if update_count:
                 update_label = "change" if update_count == 1 else "changes"
                 with st.expander(f"Change history ({update_count} {update_label})"):
-                    render_event_timeline(event_key, compact=True, peril=row.get("peril"))
+                    render_event_timeline(event_key, compact=True)
             else:
                 st.caption("No changes recorded since first observed.")
             ncol, mcol = st.columns(2)
@@ -2208,13 +2129,6 @@ def app():
         st.error("No feed items loaded. Check connectivity or source availability.")
         return
     st.session_state.history_write_status = history_write_status
-    if "history_changes" in df.columns:
-        cyclone_mask = df["peril"].eq("Tropical Cyclone")
-        for index in df.index[cyclone_mask]:
-            focused = df.at[index, "history_changes"] or []
-            df.at[index, "changes"] = focused
-            df.at[index, "is_material_update"] = bool(focused)
-            df.at[index, "update_type"] = "Material cyclone update" if focused else "No material change"
 
     new_ids = update_new_ids(set(df["event_id"]), refresh_token)
     filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
