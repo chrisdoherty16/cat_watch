@@ -12,10 +12,12 @@ Likely dependencies beyond your current hurricane app:
     uv add feedparser requests beautifulsoup4 python-dateutil pandas pydeck tropycal streamlit numpy google-genai
 """
 
+import io
 import math
 import re
 import time
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone
 from html import unescape
 
@@ -54,6 +56,7 @@ APP_TITLE = "CatWatch"
 REQUEST_HEADERS = {"User-Agent": "CatWatch/2.0 global catastrophe monitoring dashboard"}
 GDACS_RSS_URL = "https://www.gdacs.org/XML/RSS.xml"
 CALFIRE_URL = "https://incidents.fire.ca.gov/umbraco/api/IncidentApi/List?inactive=false"
+GDELT_EXPORT_BASE = "https://data.gdeltproject.org/gdeltv2"
 
 # Preferred Flash models, best first. We pick whichever your key can access.
 GEMINI_MODELS = [
@@ -94,6 +97,13 @@ SEVERITY_COLOR = {
     "Watch": [255, 150, 35],
     "Advisory": [255, 220, 40],
     "Info": [150, 160, 175],
+}
+
+GDACS_ALERT_COLOR = {
+    "Red": [230, 25, 75],
+    "Orange": [255, 150, 35],
+    "Green": [70, 210, 110],
+    "Unknown": [150, 160, 175],
 }
 
 # Tropical-cyclone category palette. Single source of truth for map + legend.
@@ -751,7 +761,7 @@ def load_gdacs_events():
         alert = infer_alert_level(raw_title, summary)
         mag = extract_magnitude(f"{raw_title} {summary}")
         severity = severity_from_alert(alert, peril, mag)
-        color = SEVERITY_COLOR.get(severity, SEVERITY_COLOR["Info"])
+        color = GDACS_ALERT_COLOR.get(alert, GDACS_ALERT_COLOR["Unknown"])
 
         metric_bits = []
         if mag is not None:
@@ -839,6 +849,107 @@ def load_calfire_events():
             "metrics": {"acres": acres, "contained_pct": contained},
             "metric_text": " · ".join(metric_bits),
             "color": SEVERITY_COLOR.get(severity, SEVERITY_COLOR["Info"]),
+        })
+    return events
+
+
+# ---------------------------------------------------------------------------
+# Civil unrest - lightweight GDELT protest/unrest layer
+# ---------------------------------------------------------------------------
+
+GDELT_EVENT_COLUMNS = [
+    "GLOBALEVENTID", "SQLDATE", "MonthYear", "Year", "FractionDate",
+    "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode",
+    "Actor1EthnicCode", "Actor1Religion1Code", "Actor1Religion2Code", "Actor1Type1Code",
+    "Actor1Type2Code", "Actor1Type3Code", "Actor2Code", "Actor2Name", "Actor2CountryCode",
+    "Actor2KnownGroupCode", "Actor2EthnicCode", "Actor2Religion1Code", "Actor2Religion2Code",
+    "Actor2Type1Code", "Actor2Type2Code", "Actor2Type3Code", "IsRootEvent", "EventCode",
+    "EventBaseCode", "EventRootCode", "QuadClass", "GoldsteinScale", "NumMentions",
+    "NumSources", "NumArticles", "AvgTone", "Actor1Geo_Type", "Actor1Geo_FullName",
+    "Actor1Geo_CountryCode", "Actor1Geo_ADM1Code", "Actor1Geo_ADM2Code", "Actor1Geo_Lat",
+    "Actor1Geo_Long", "Actor1Geo_FeatureID", "Actor2Geo_Type", "Actor2Geo_FullName",
+    "Actor2Geo_CountryCode", "Actor2Geo_ADM1Code", "Actor2Geo_ADM2Code", "Actor2Geo_Lat",
+    "Actor2Geo_Long", "Actor2Geo_FeatureID", "ActionGeo_Type", "ActionGeo_FullName",
+    "ActionGeo_CountryCode", "ActionGeo_ADM1Code", "ActionGeo_ADM2Code", "ActionGeo_Lat",
+    "ActionGeo_Long", "ActionGeo_FeatureID", "DATEADDED", "SOURCEURL",
+]
+
+
+def _gdelt_export_timestamps(hours=6):
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    minute = (now.minute // 15) * 15
+    now = now.replace(minute=minute)
+    return [(now - timedelta(minutes=15 * i)).strftime("%Y%m%d%H%M%S") for i in range(max(1, int(hours * 4)))]
+
+
+@st.cache_data(ttl=900, show_spinner="Loading civil unrest signals from GDELT...")
+def load_civil_unrest_events(hours=6, max_files=12, max_events=150):
+    rows = []
+    for stamp in _gdelt_export_timestamps(hours=hours)[:max_files]:
+        url = f"{GDELT_EXPORT_BASE}/{stamp}.export.CSV.zip"
+        try:
+            resp = requests.get(url, headers=REQUEST_HEADERS, timeout=12)
+            if resp.status_code != 200 or not resp.content:
+                continue
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                names = zf.namelist()
+                if not names:
+                    continue
+                with zf.open(names[0]) as fh:
+                    df = pd.read_csv(fh, sep="\t", header=None, names=GDELT_EVENT_COLUMNS, dtype=str, low_memory=False)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        df = df[df["EventRootCode"].astype(str).str.zfill(2).eq("14")].copy()
+        if df.empty:
+            continue
+        df["lat"] = pd.to_numeric(df["ActionGeo_Lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["ActionGeo_Long"], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        if not df.empty:
+            rows.append(df)
+    if not rows:
+        return []
+    df = pd.concat(rows, ignore_index=True)
+    for col in ["NumMentions", "NumSources", "NumArticles"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["DATEADDED_DT"] = pd.to_datetime(df["DATEADDED"], format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+    df["rank"] = df["NumMentions"] + df["NumSources"] * 2 + df["NumArticles"]
+    df = df.sort_values(["rank", "DATEADDED_DT"], ascending=[False, False]).drop_duplicates(subset=["ActionGeo_FullName", "EventCode", "SOURCEURL"]).head(max_events)
+    events = []
+    for _, row in df.iterrows():
+        location = clean_html(row.get("ActionGeo_FullName") or "Unknown location")
+        actor = clean_html(row.get("Actor1Name") or "")
+        code = str(row.get("EventCode") or "14")
+        mentions = int(row.get("NumMentions") or 0)
+        sources = int(row.get("NumSources") or 0)
+        articles = int(row.get("NumArticles") or 0)
+        updated = row.get("DATEADDED_DT")
+        if pd.isna(updated):
+            updated = None
+        summary_bits = ["News-derived GDELT protest/unrest signal", f"CAMEO event code {code}", f"mentions {mentions}", f"sources {sources}"]
+        if actor:
+            summary_bits.insert(1, f"actor: {actor.title()}")
+        severity = "Watch" if sources >= 5 or mentions >= 20 else "Advisory"
+        events.append({
+            "event_id": f"GDELT|{row.get('GLOBALEVENTID')}",
+            "source": "GDELT",
+            "peril": "Civil Unrest",
+            "title": f"Civil unrest signal in {location}",
+            "summary": " · ".join(summary_bits),
+            "severity": severity,
+            "alert_level": "Unknown",
+            "lat": to_float(row.get("lat")),
+            "lon": to_float(row.get("lon")),
+            "published_utc": updated,
+            "updated_utc": updated,
+            "time": fmt_bermuda(updated) if updated is not None else "—",
+            "age": age_label(updated) if updated is not None else "Unknown age",
+            "url": row.get("SOURCEURL") or "https://www.gdeltproject.org/",
+            "metrics": {"mentions": mentions, "sources": sources, "articles": articles, "cameo_code": code},
+            "metric_text": f"{sources} sources · {mentions} mentions",
+            "color": PERIL_META["Civil Unrest"]["color"],
         })
     return events
 
@@ -959,13 +1070,9 @@ def render_world_map(events, tropical_systems=None, height=560, show_tracks=True
 
 
 def render_static_legend(include_tc=True, include_perils=True, perils=None):
-    """Visual legend only. Filtering is handled by the clickable map-layer selector."""
     bits = []
     if include_tc:
-        bits += [
-            f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.22);color:rgb({r},{g},{b})">{label}</span>'
-            for label, (r, g, b) in TC_PALETTE.items()
-        ]
+        bits += [f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.22);color:rgb({r},{g},{b})">{label}</span>' for label, (r, g, b) in TC_PALETTE.items()]
     if include_perils:
         wanted = perils or [p for p in PERIL_META if p != "Tropical Cyclone"]
         for peril in wanted:
@@ -973,9 +1080,7 @@ def render_static_legend(include_tc=True, include_perils=True, perils=None):
                 continue
             meta = PERIL_META[peril]
             r, g, b = meta["color"]
-            bits.append(
-                f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.20);color:rgb({r},{g},{b})">{meta["icon"]} {peril}</span>'
-            )
+            bits.append(f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.20);color:rgb({r},{g},{b})">{meta["icon"]} {peril}</span>')
     if bits:
         st.markdown(" ".join(bits), unsafe_allow_html=True)
 
@@ -993,9 +1098,31 @@ def select_map_layers(available_perils, key, label="Map layers"):
     return [label_to_peril[x] for x in chosen]
 
 
+def select_gdacs_alert_levels(events, key):
+    gdacs_alerts = [e.get("alert_level", "Unknown") for e in events if e.get("source") == "GDACS"]
+    available = [x for x in ["Red", "Orange", "Green", "Unknown"] if x in gdacs_alerts]
+    if not available:
+        return []
+    labels = {"Red": "🔴 Red", "Orange": "🟠 Orange", "Green": "🟢 Green", "Unknown": "⚪ Unknown"}
+    display = [labels[x] for x in available]
+    label_to_alert = {labels[x]: x for x in available}
+    if hasattr(st, "pills"):
+        chosen = st.pills("GDACS alert", display, selection_mode="multi", default=display, key=key)
+    else:
+        chosen = st.multiselect("GDACS alert", display, default=display, key=key)
+    return [label_to_alert[x] for x in chosen]
+
+
 def filter_events_by_peril(events, selected_perils):
     selected = set(selected_perils)
     return [e for e in events if e.get("peril") in selected]
+
+
+def filter_events_by_gdacs_alert(events, selected_alerts):
+    if not selected_alerts:
+        return events
+    wanted = set(selected_alerts)
+    return [e for e in events if e.get("source") != "GDACS" or e.get("alert_level", "Unknown") in wanted]
 
 
 def render_event_card(event):
@@ -1003,7 +1130,6 @@ def render_event_card(event):
     metric = event.get("metric_text") or event.get("alert_level") or ""
     url = event.get("url") or ""
     summary = display_summary(event.get("summary", ""), max_len=360)
-
     with st.container(border=True):
         st.markdown(f"**{peril_icon(event.get('peril'))} {event.get('peril')} · {event.get('source')}**")
         st.markdown(f"### {event.get('title')}")
@@ -1015,20 +1141,14 @@ def render_event_card(event):
 
 
 def render_tc_card(s, ai_on=False):
-    """Native Streamlit card to avoid raw HTML rendering issues on JTWC cards."""
     fo = s.get("outlook")
-    brief = None
-    if ai_on and not s.get("invest"):
-        brief = ai_brief(storm_facts(s), s.get("discussion"))
-    if not brief:
-        brief = fallback_brief(s)
-
+    brief = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
+    brief = brief or fallback_brief(s)
     badges = [s.get("klass", ""), s.get("source", "")]
     if fo and fo.get("peak_klass") != s.get("klass") and fo.get("by"):
         badges.append(f"⏱ {fo['peak_klass']} by {fo['by']}")
     if fo:
         badges.append(fo.get("trend", ""))
-
     pressure = f"{s['mslp']:.0f} mb" if s.get("mslp") else "N/A"
     with st.container(border=True):
         st.markdown(" ".join(f"`{b}`" for b in badges if b))
@@ -1044,18 +1164,13 @@ def render_headline(events, tropical_systems):
     combined = [tc_to_map_event(s) for s in tropical_systems if not s.get("invest")] + list(events)
     urgent = [e for e in combined if e.get("severity") in ("Critical", "Watch")]
     urgent.sort(key=lambda e: (severity_rank(e.get("severity")), e.get("peril", ""), e.get("title", "")))
-
     st.subheader("Morning headline")
     if not urgent:
         st.success("No Critical or Watch-level events in the current feed set.")
         return
     for e in urgent[:8]:
         metric = f" · {e.get('metric_text')}" if e.get("metric_text") else ""
-        st.markdown(
-            f"**{peril_icon(e.get('peril'))} {e.get('severity')} · {e.get('peril')} · {e.get('title')}**{metric}  "
-            f"<span class='cw-muted'>{e.get('source', '')} · {e.get('time', '—')}</span>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"**{peril_icon(e.get('peril'))} {e.get('severity')} · {e.get('peril')} · {e.get('title')}**{metric}  <span class='cw-muted'>{e.get('source', '')} · {e.get('time', '—')}</span>", unsafe_allow_html=True)
 
 
 def render_monitoring_summary(map_events):
@@ -1066,27 +1181,21 @@ def render_monitoring_summary(map_events):
     crit = sum(1 for e in map_events if e.get("severity") == "Critical")
     watch = sum(1 for e in map_events if e.get("severity") == "Watch")
     perils = sorted({e.get("peril", "Other") for e in map_events})
-    peril_text = " · ".join(f"{peril_icon(p)} {p}" for p in perils)
-    st.markdown(
-        f"**Monitoring {total} current event{'s' if total != 1 else ''} across {len(perils)} peril layer{'s' if len(perils) != 1 else ''}.** "
-        f"Critical: **{crit}** · Watch: **{watch}**"
-    )
-    st.caption(peril_text)
+    st.markdown(f"**Monitoring {total} current event{'s' if total != 1 else ''} across {len(perils)} peril layer{'s' if len(perils) != 1 else ''}.** Critical: **{crit}** · Watch: **{watch}**")
 
 
-def render_overview(tropical_systems, gdacs_events, calfire_events, jtwc_loading):
-    other_events = gdacs_events + calfire_events
+def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading):
+    other_events = gdacs_events + calfire_events + civil_unrest_events
     all_events = [tc_to_map_event(s) for s in tropical_systems] + other_events
-
     if jtwc_loading:
         st.caption("⏳ Loading global JTWC tropical systems in the background...")
-
     render_monitoring_summary(all_events)
     available = sorted({e.get("peril") for e in all_events if e.get("peril")})
     selected = select_map_layers(available, key="overview_map_layers")
     filtered_events = filter_events_by_peril(all_events, selected)
+    gdacs_alerts = select_gdacs_alert_levels(filtered_events, key="overview_gdacs_alerts")
+    filtered_events = filter_events_by_gdacs_alert(filtered_events, gdacs_alerts)
     filtered_tcs = tropical_systems if "Tropical Cyclone" in selected else []
-
     render_static_legend(include_tc="Tropical Cyclone" in selected, include_perils=True, perils=selected)
     render_world_map(filtered_events, tropical_systems=filtered_tcs, height=570, show_tracks=True, key="overview_map")
     render_headline(other_events, tropical_systems)
@@ -1098,25 +1207,20 @@ def render_hurricane_watch(tropical_systems, jtwc_loading):
     if not tropical_systems:
         st.info("No active tropical systems anywhere right now.")
         return
-
     render_static_legend(include_tc=True, include_perils=False)
     render_world_map([tc_to_map_event(s) for s in tropical_systems], tropical_systems=tropical_systems, height=540, show_tracks=True, key="tc_map")
-
     storms = [s for s in tropical_systems if not s["invest"]]
     invests = [s for s in tropical_systems if s["invest"]]
     ai_on = bool(gemini_key())
-
     hdr = f"{len(storms)} storm{'s' if len(storms) != 1 else ''}"
     if invests:
         hdr += f" · {len(invests)} area{'s' if len(invests) != 1 else ''} of interest"
     st.subheader(f"Currently monitoring — {hdr}")
     st.caption("🧠 AI briefs on" if ai_on else "AI briefs off — add GEMINI_API_KEY to .streamlit/secrets.toml to enable.")
-
     cols = st.columns(3)
     for i, s in enumerate(storms):
         with cols[i % 3]:
             render_tc_card(s, ai_on=ai_on)
-
     st.markdown("---")
     st.subheader(f"Formation outlook — {len(invests)} area{'s' if len(invests) != 1 else ''} of interest")
     if not invests:
@@ -1143,12 +1247,12 @@ def render_peril_tab(title, events, caption=None, icon=None):
     if not events:
         st.info(f"No current {title.lower()} events available from the active source set.")
         return
-
     available = sorted({e.get("peril") for e in events if e.get("peril")})
     selected = select_map_layers(available, key=f"{title.lower().replace(' ', '_')}_layers")
     filtered = filter_events_by_peril(events, selected)
+    gdacs_alerts = select_gdacs_alert_levels(filtered, key=f"{title.lower().replace(' ', '_')}_gdacs_alerts")
+    filtered = filter_events_by_gdacs_alert(filtered, gdacs_alerts)
     filtered.sort(key=lambda e: (severity_rank(e.get("severity")), ALERT_ORDER.get(e.get("alert_level"), 9), e.get("title", "")))
-
     render_static_legend(include_tc=False, include_perils=True, perils=selected)
     render_world_map(filtered, tropical_systems=[], height=500, show_tracks=False, key=f"{title}_map")
     st.subheader(f"{icon or ''} {title} — {len(filtered)}")
@@ -1158,19 +1262,18 @@ def render_peril_tab(title, events, caption=None, icon=None):
             render_event_card(event)
 
 
-def render_civil_unrest_tab():
-    st.info(
-        "No civil unrest layer is wired in yet. GDACS is a natural-hazard disaster alerting source, not a civil unrest feed. "
-        "If you want this later, it should be a separate source module, likely ACLED, GDELT, or a curated security/news feed, not GDACS."
-    )
+def render_civil_unrest_tab(civil_unrest_events):
+    st.caption("News-derived civil unrest/protest signals from recent GDELT event exports. Treat as directional signal, not a verified loss/event feed.")
+    render_peril_tab("Civil Unrest", civil_unrest_events, caption=None, icon="⚠️")
 
 
-def render_data_table(tropical_systems, gdacs_events, calfire_events):
+def render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events):
     rows = []
     for s in tropical_systems:
         rows.append(tc_to_map_event(s))
     rows.extend(gdacs_events)
     rows.extend(calfire_events)
+    rows.extend(civil_unrest_events)
     if not rows:
         st.info("No events loaded.")
         return
@@ -1181,58 +1284,30 @@ def render_data_table(tropical_systems, gdacs_events, calfire_events):
             df[col] = None
     df["severity_rank"] = df["severity"].map(SEVERITY_ORDER).fillna(9)
     df = df.sort_values(["severity_rank", "peril", "source", "title"]).drop(columns=["severity_rank"])
-    st.dataframe(
-        df[keep],
-        use_container_width=True,
-        hide_index=True,
-        column_config={"url": st.column_config.LinkColumn("Source")},
-    )
-
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
+    st.dataframe(df[keep], use_container_width=True, hide_index=True, column_config={"url": st.column_config.LinkColumn("Source")})
 
 
 def app():
     st.title("🌍 CatWatch")
-    st.caption("Morning global catastrophe monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS/CAL FIRE")
-
+    st.caption("Morning global catastrophe monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS/CAL FIRE/GDELT")
     tropical_systems, jtwc_loading = get_tropical_systems()
     gdacs_events = load_gdacs_events()
     calfire_events = load_calfire_events()
-
+    civil_unrest_events = load_civil_unrest_events()
     ca_wildfire_events = list(calfire_events)
     global_wildfire_events = [e for e in gdacs_events if e.get("peril") == "Wildfire"]
     earthquake_events = [e for e in gdacs_events if e.get("peril") == "Earthquake"]
     flood_events = [e for e in gdacs_events if e.get("peril") == "Flood"]
     drought_events = [e for e in gdacs_events if e.get("peril") == "Drought"]
-
-    tabs = st.tabs([
-        "Overview",
-        "Hurricanes",
-        "CA Wildfire",
-        "Global Wildfire",
-        "Earthquake",
-        "Flood",
-        "Drought",
-        "Civil Unrest",
-        "Data",
-    ])
-
+    tabs = st.tabs(["Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Data"])
     with tabs[0]:
-        render_overview(tropical_systems, gdacs_events, calfire_events, jtwc_loading)
+        render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading)
     with tabs[1]:
         render_hurricane_watch(tropical_systems, jtwc_loading)
     with tabs[2]:
         render_peril_tab("CA Wildfire", ca_wildfire_events, caption="Active California wildfire incidents from CAL FIRE.", icon="🔥")
     with tabs[3]:
-        render_peril_tab(
-            "Global Wildfire",
-            global_wildfire_events,
-            caption="Global wildfire/forest fire alerts from GDACS. CAL FIRE incidents are kept in the separate CA Wildfire tab.",
-            icon="🔥",
-        )
+        render_peril_tab("Global Wildfire", global_wildfire_events, caption="Global wildfire/forest fire alerts from GDACS. CAL FIRE incidents are kept in the separate CA Wildfire tab.", icon="🔥")
     with tabs[4]:
         render_peril_tab("Earthquake", earthquake_events, caption="Earthquake alerts from GDACS.", icon="🌎")
     with tabs[5]:
@@ -1240,19 +1315,10 @@ def app():
     with tabs[6]:
         render_peril_tab("Drought", drought_events, caption="Drought alerts from GDACS where available.", icon="☀️")
     with tabs[7]:
-        render_civil_unrest_tab()
+        render_civil_unrest_tab(civil_unrest_events)
     with tabs[8]:
-        render_data_table(tropical_systems, gdacs_events, calfire_events)
-
-    components.html(
-        """
-        <script>
-        setTimeout(function(){ window.parent.location.reload(); }, 15 * 60 * 1000);
-        </script>
-        """,
-        height=0,
-    )
-
+        render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events)
+    components.html("""<script>setTimeout(function(){ window.parent.location.reload(); }, 15 * 60 * 1000);</script>""", height=0)
     if jtwc_loading:
         time.sleep(4)
         st.rerun()
