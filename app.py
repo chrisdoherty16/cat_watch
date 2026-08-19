@@ -655,23 +655,39 @@ def ai_brief(facts, discussion=None):
 
 def infer_gdacs_peril(title, summary):
     text = f"{title} {summary}".lower()
+    title_text = (title or "").strip()
     if any(x in text for x in ["tropical cyclone", "hurricane", "typhoon", "cyclone"]):
         return "Tropical Cyclone"
-    if any(x in text for x in ["earthquake", "magnitude", " seismic", "m "]):
-        return "Earthquake"
+    if "drought" in text:
+        return "Drought"
     if "flood" in text:
         return "Flood"
     if any(x in text for x in ["forest fire", "wildfire", "wild fire", "bushfire"]):
         return "Wildfire"
     if any(x in text for x in ["volcano", "eruption", "volcanic"]):
         return "Volcano"
-    if "drought" in text:
-        return "Drought"
+    if any(x in text for x in ["earthquake", "magnitude", " seismic"]):
+        return "Earthquake"
+    if re.search(r"^m\s*\d+(?:\.\d+)?\b", title_text, flags=re.IGNORECASE):
+        return "Earthquake"
     return "Other"
 
-
-def infer_alert_level(title, summary):
-    text = f"{title} {summary}".lower()
+def infer_alert_level(title, summary, entry=None):
+    values = []
+    if entry is not None:
+        for key in (
+            "gdacs_alertlevel", "gdacs_alert_level", "gdacs_alertlevel_text",
+            "alertlevel", "alert_level", "gdacs:alertlevel", "gdacs_alert"
+        ):
+            try:
+                v = entry.get(key)
+            except Exception:
+                v = None
+            if v:
+                values.append(str(v))
+    values.append(str(title or ""))
+    values.append(str(summary or ""))
+    text = " ".join(values).lower()
     if re.search(r"\bred\b", text):
         return "Red"
     if re.search(r"\borange\b", text):
@@ -679,7 +695,6 @@ def infer_alert_level(title, summary):
     if re.search(r"\bgreen\b", text):
         return "Green"
     return "Unknown"
-
 
 def severity_from_alert(alert, peril="Other", magnitude=None):
     if alert == "Red":
@@ -758,7 +773,7 @@ def load_gdacs_events():
         lat, lon = extract_latlon(entry)
         published = parse_entry_dt(entry)
         link = entry.get("link", GDACS_RSS_URL)
-        alert = infer_alert_level(raw_title, summary)
+        alert = infer_alert_level(raw_title, summary, entry)
         mag = extract_magnitude(f"{raw_title} {summary}")
         severity = severity_from_alert(alert, peril, mag)
         color = GDACS_ALERT_COLOR.get(alert, GDACS_ALERT_COLOR["Unknown"])
@@ -835,7 +850,7 @@ def load_calfire_events():
             "event_id": f"CALFIRE|{name}".lower(),
             "source": "CAL FIRE",
             "peril": "Wildfire",
-            "title": f"{name} fire",
+            "title": name if str(name).strip().lower().endswith("fire") else f"{name} fire",
             "summary": summary,
             "severity": severity,
             "alert_level": "Unknown",
@@ -1100,10 +1115,10 @@ def select_map_layers(available_perils, key, label="Map layers"):
 
 def select_gdacs_alert_levels(events, key):
     gdacs_alerts = [e.get("alert_level", "Unknown") for e in events if e.get("source") == "GDACS"]
-    available = [x for x in ["Red", "Orange", "Green", "Unknown"] if x in gdacs_alerts]
+    available = [x for x in ["Red", "Orange", "Green"] if x in gdacs_alerts]
     if not available:
         return []
-    labels = {"Red": "🔴 Red", "Orange": "🟠 Orange", "Green": "🟢 Green", "Unknown": "⚪ Unknown"}
+    labels = {"Red": "🔴 Red", "Orange": "🟠 Orange", "Green": "🟢 Green"}
     display = [labels[x] for x in available]
     label_to_alert = {labels[x]: x for x in available}
     if hasattr(st, "pills"):
@@ -1111,7 +1126,6 @@ def select_gdacs_alert_levels(events, key):
     else:
         chosen = st.multiselect("GDACS alert", display, default=display, key=key)
     return [label_to_alert[x] for x in chosen]
-
 
 def filter_events_by_peril(events, selected_perils):
     selected = set(selected_perils)
@@ -1130,35 +1144,55 @@ def render_event_card(event):
     metric = event.get("metric_text") or event.get("alert_level") or ""
     url = event.get("url") or ""
     summary = display_summary(event.get("summary", ""), max_len=360)
+    source = event.get("source", "")
+    peril = event.get("peril", "Other")
+    title = event.get("title") or "Untitled event"
+
+    if source == "GDACS":
+        alert = event.get("alert_level", "Unknown")
+        if alert != "Unknown":
+            r, g, b = GDACS_ALERT_COLOR.get(alert, GDACS_ALERT_COLOR["Unknown"])
+            heading = f'<span style="color:rgb({r},{g},{b});font-weight:800">[{alert}]</span> {title}'
+        else:
+            heading = title
+        subline = " · ".join(x for x in [peril, source, metric, event.get("time", "—"), event.get("age", "")] if x)
+    else:
+        heading = title
+        subline = " · ".join(x for x in [sev, metric, event.get("time", "—"), event.get("age", "")] if x)
+
     with st.container(border=True):
-        st.markdown(f"**{peril_icon(event.get('peril'))} {event.get('peril')} · {event.get('source')}**")
-        st.markdown(f"### {event.get('title')}")
-        st.caption(" · ".join(x for x in [sev, metric, event.get("time", "—"), event.get("age", "")] if x))
+        st.markdown(f"**{peril_icon(peril)} {peril} · {source}**")
+        st.markdown(f"### {heading}", unsafe_allow_html=True)
+        st.caption(subline)
         if summary:
             st.write(summary)
         if url:
             st.markdown(f"[Open source ↗]({url})")
 
-
 def render_tc_card(s, ai_on=False):
     fo = s.get("outlook")
     brief = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
     brief = brief or fallback_brief(s)
-    badges = [s.get("klass", ""), s.get("source", "")]
+    r, g, b = tc_color(s.get("vmax"), s.get("invest"))
+
+    chips = [
+        f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.20);color:rgb({r},{g},{b})">{s.get("klass", "")}</span>',
+        f'<span class="cw-chip">{s.get("source", "")}</span>',
+    ]
     if fo and fo.get("peak_klass") != s.get("klass") and fo.get("by"):
-        badges.append(f"⏱ {fo['peak_klass']} by {fo['by']}")
+        chips.append(f'<span class="cw-chip cw-orange">⏱ {fo["peak_klass"]} by {fo["by"]}</span>')
     if fo:
-        badges.append(fo.get("trend", ""))
+        chips.append(f'<span class="cw-chip">{fo.get("trend", "")}</span>')
+
     pressure = f"{s['mslp']:.0f} mb" if s.get("mslp") else "N/A"
     with st.container(border=True):
-        st.markdown(" ".join(f"`{b}`" for b in badges if b))
+        st.markdown(" ".join(chips), unsafe_allow_html=True)
         st.markdown(f"### {s['name']}")
         st.markdown(f":violet[**{brief}**]")
         st.caption(f"Winds {s['vmax']:.0f} kt · Pressure {pressure} · Moving {s['move']}")
         st.caption(f"{s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}")
         if s.get("url"):
             st.markdown(f"[NHC source ↗]({s['url']})")
-
 
 def render_headline(events, tropical_systems):
     combined = [tc_to_map_event(s) for s in tropical_systems if not s.get("invest")] + list(events)
