@@ -1,79 +1,141 @@
+"""
+CatWatch — morning catastrophe monitoring board.
+
+Primary tropical cyclone layer: NHC + JTWC via Tropycal.
+Other global perils layer: GDACS RSS, excluding tropical cyclones to avoid double-counting.
+Optional wildfire supplement: CAL FIRE active incidents.
+
+Run:
+    uv run streamlit run app.py
+
+Likely dependencies beyond your current hurricane app:
+    uv add feedparser requests beautifulsoup4 python-dateutil pandas pydeck tropycal streamlit numpy google-genai
+"""
+
+import math
 import re
-import json
-import os
-import sqlite3
-import hashlib
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
+import time
+import threading
+from datetime import datetime, timedelta, timezone
 from html import unescape
 
-import feedparser
+import numpy as np
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
-import plotly.graph_objects as go
+from tropycal import realtime
 
 try:
-    from streamlit_autorefresh import st_autorefresh
+    import feedparser
 except Exception:
-    st_autorefresh = None
+    feedparser = None
+
 try:
-    from supabase import create_client
+    from zoneinfo import ZoneInfo
+    BERMUDA_TZ = ZoneInfo("Atlantic/Bermuda")
 except Exception:
-    create_client = None
+    BERMUDA_TZ = None
+
+# Optional AI layer. Absent library or key -> app runs unchanged.
 try:
-    import google.generativeai as genai
+    from google import genai
 except Exception:
     genai = None
-try:
-    from pydantic import BaseModel, Field
-except Exception:
-    BaseModel = None
 
-APP_TITLE = "Global Cat Watch"
-# Free-tier Gemini Flash model. Change here if Google renames the free model.
-GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_REFRESH_MINUTES = 10
-HISTORY_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cat_event_history.db")
-REQUEST_HEADERS = {"User-Agent": "GlobalCatWatch/1.0 (monitoring dashboard)"}
+# ---------------------------------------------------------------------------
+# Page config + constants
+# ---------------------------------------------------------------------------
 
-FEEDS = [
-    {"source": "GDACS", "name": "GDACS All Events", "url": "https://www.gdacs.org/XML/RSS.xml", "default_peril": "All"},
-    {"source": "NHC", "name": "NHC Atlantic Active Cyclones", "url": "https://www.nhc.noaa.gov/index-at.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC East Pacific Active Cyclones", "url": "https://www.nhc.noaa.gov/index-ep.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC Central Pacific Active Cyclones", "url": "https://www.nhc.noaa.gov/index-cp.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC Graphical Tropical Weather Outlook", "url": "https://www.nhc.noaa.gov/gtwo.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC Atlantic Tropical Weather Outlook", "url": "https://www.nhc.noaa.gov/xml/TWOAT.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC East Pacific Tropical Weather Outlook", "url": "https://www.nhc.noaa.gov/xml/TWOEP.xml", "default_peril": "Tropical Cyclone"},
-    {"source": "NHC", "name": "NHC Central Pacific Tropical Weather Outlook", "url": "https://www.nhc.noaa.gov/xml/TWOCP.xml", "default_peril": "Tropical Cyclone"},
-]
-
+APP_TITLE = "CatWatch"
+REQUEST_HEADERS = {"User-Agent": "CatWatch/2.0 global catastrophe monitoring dashboard"}
+GDACS_RSS_URL = "https://www.gdacs.org/XML/RSS.xml"
 CALFIRE_URL = "https://incidents.fire.ca.gov/umbraco/api/IncidentApi/List?inactive=false"
 
-NEWS_SOURCES = {
-    "BBC": "bbc.com", "CNBC": "cnbc.com", "Reuters": "reuters.com", "AP": "apnews.com",
-    "Al Jazeera": "aljazeera.com", "Guardian": "theguardian.com", "Bloomberg": "bloomberg.com",
-    "Insurance Insider": "insuranceinsider.com", "Artemis": "artemis.bm", "Reinsurance News": "reinsurancene.ws",
-}
+# Preferred Flash models, best first. We pick whichever your key can access.
+GEMINI_MODELS = [
+    "gemini-flash-latest",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+]
 
-PERIL_ORDER = ["Tropical Cyclone", "Earthquake", "Flood", "Wildfire", "Volcano", "Drought", "Other"]
-TIER_ORDER = {"Critical": 0, "Watch": 1, "Advisory": 2, "Info": 3}
+PERIL_ORDER = [
+    "Tropical Cyclone",
+    "Earthquake",
+    "Flood",
+    "Wildfire",
+    "Volcano",
+    "Drought",
+    "Civil Unrest",
+    "Other",
+]
+
+SEVERITY_ORDER = {"Critical": 0, "Watch": 1, "Advisory": 2, "Info": 3}
 ALERT_ORDER = {"Red": 0, "Orange": 1, "Green": 2, "Unknown": 3}
 
-TIER_HEX = {"Critical": "#DC322F", "Watch": "#F08C14", "Advisory": "#E6C828", "Info": "#8C96A0"}
-TIER_SIZE = {"Critical": 20, "Watch": 16, "Advisory": 13, "Info": 10}
-
-BASIN_MAP = {
-    "nwpacific": "NW Pacific", "westpacific": "W Pacific", "nepacific": "NE Pacific",
-    "eastpacific": "E Pacific", "southpacific": "South Pacific", "northatlantic": "North Atlantic",
-    "southatlantic": "South Atlantic", "northindian": "North Indian", "southindian": "South Indian",
-    "southwestindian": "SW Indian", "arabiansea": "Arabian Sea", "bayofbengal": "Bay of Bengal",
+PERIL_META = {
+    "Tropical Cyclone": {"icon": "🌪️", "color": [80, 180, 255]},
+    "Earthquake": {"icon": "🌎", "color": [255, 90, 70]},
+    "Flood": {"icon": "🌊", "color": [60, 150, 255]},
+    "Wildfire": {"icon": "🔥", "color": [255, 120, 35]},
+    "Volcano": {"icon": "🌋", "color": [210, 80, 255]},
+    "Drought": {"icon": "☀️", "color": [245, 200, 70]},
+    "Civil Unrest": {"icon": "⚠️", "color": [190, 170, 255]},
+    "Other": {"icon": "📌", "color": [160, 170, 185]},
 }
-_STOP_LOC_WORDS = {"On", "From", "During", "Until", "Last", "Started", "Ongoing", "In", "At", "Center"}
+
+SEVERITY_COLOR = {
+    "Critical": [230, 25, 75],
+    "Watch": [255, 150, 35],
+    "Advisory": [255, 220, 40],
+    "Info": [150, 160, 175],
+}
+
+# Tropical-cyclone category palette. Single source of truth for map + legend.
+TC_PALETTE = {
+    "Cat 5": [230, 25, 75],
+    "Cat 4": [255, 100, 40],
+    "Cat 3": [255, 165, 0],
+    "Cat 2": [255, 225, 25],
+    "Cat 1": [150, 220, 80],
+    "Trop. Storm": [40, 200, 215],
+    "Depression": [90, 150, 255],
+    "Invest": [150, 160, 175],
+}
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🌍", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
+    .cw-card {
+        background:#12151c; border:1px solid #2a2f3a; border-radius:13px;
+        padding:14px 15px; margin-bottom:12px;
+    }
+    .cw-muted { color:#9aa4b2; font-size:0.86rem; }
+    .cw-brief { color:#ff8ac4; font-weight:650; }
+    .cw-chip {
+        display:inline-block; padding:3px 8px; border-radius:999px; margin-right:5px;
+        font-size:0.78rem; font-weight:650; background:#202532; color:#e6e9ef;
+    }
+    .cw-red { background:#3b171a; color:#ff7373; }
+    .cw-orange { background:#3b2714; color:#ffb35c; }
+    .cw-yellow { background:#393414; color:#ffe066; }
+    .cw-grey { background:#232833; color:#cdd3de; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 
 def clean_html(value: str) -> str:
@@ -83,34 +145,73 @@ def clean_html(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
-def format_numbers(text: str) -> str:
-    if not text:
-        return text
-
-    def repl(m):
-        num = m.group(0)
-        val = int(num)
-        if len(num) == 4 and 1900 <= val <= 2100:
-            return num
-        return f"{val:,}"
-
-    return re.sub(r"(?<![\d/])\d{4,}(?![\d/])", repl, text)
-
-
-def display_summary(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r"\s*The cyclone affects these countries:.*?vulnerability[^)]*\)\.", "", text, flags=re.IGNORECASE)
-    text = text.replace("[unknown]", "n/a")
-    text = format_numbers(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def to_float(x):
+def to_float(value):
     try:
-        return float(x)
+        if value is None or value == "":
+            return None
+        out = float(value)
+        if math.isnan(out):
+            return None
+        return out
     except Exception:
         return None
+
+
+def parse_dt(value):
+    if not value:
+        return None
+    try:
+        dt = dtparser.parse(str(value))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_entry_dt(entry):
+    for key in ("published", "updated", "created"):
+        dt = parse_dt(entry.get(key))
+        if dt:
+            return dt
+    for key in ("published_parsed", "updated_parsed"):
+        parsed = entry.get(key)
+        if parsed:
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc)
+            except Exception:
+                pass
+    return None
+
+
+def fmt_bermuda(dt):
+    """Return e.g. '19 Aug 3:00 AM ADT'. Input can be UTC-aware/naive."""
+    if dt is None or not hasattr(dt, "strftime"):
+        return "—"
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(BERMUDA_TZ) if BERMUDA_TZ else dt
+        hour12 = local.hour % 12 or 12
+        ampm = "AM" if local.hour < 12 else "PM"
+        tz = local.tzname() or ("AST" if BERMUDA_TZ else "UTC")
+        return f"{local.day} {local.strftime('%b')} {hour12}:{local.minute:02d} {ampm} {tz}"
+    except Exception:
+        return dt.strftime("%d %b %H:%MZ")
+
+
+def age_label(dt):
+    if not dt:
+        return "Unknown age"
+    secs = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h ago"
+    if hours:
+        return f"{hours}h {minutes}m ago"
+    return f"{minutes}m ago"
 
 
 def extract_latlon(entry):
@@ -118,6 +219,7 @@ def extract_latlon(entry):
     lon = to_float(entry.get("geo_long"))
     if lat is not None and lon is not None:
         return lat, lon
+
     point = entry.get("georss_point") or entry.get("point")
     if point:
         try:
@@ -125,6 +227,7 @@ def extract_latlon(entry):
             return float(a), float(b)
         except Exception:
             pass
+
     where = entry.get("where")
     if isinstance(where, dict):
         coords = where.get("coordinates")
@@ -136,470 +239,424 @@ def extract_latlon(entry):
     return None, None
 
 
-def parse_dt(value):
-    if not value:
-        return None
+def peril_icon(peril):
+    return PERIL_META.get(peril, PERIL_META["Other"])["icon"]
+
+
+def severity_rank(value):
+    return SEVERITY_ORDER.get(value, 9)
+
+
+def display_summary(text, max_len=420):
+    text = clean_html(text or "")
+    text = text.replace("[unknown]", "n/a")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+# ---------------------------------------------------------------------------
+# Tropical cyclone helpers - NHC/JTWC via Tropycal
+# ---------------------------------------------------------------------------
+
+
+def category(vmax):
+    v = vmax or 0
+    if v >= 137:
+        return 5
+    if v >= 113:
+        return 4
+    if v >= 96:
+        return 3
+    if v >= 83:
+        return 2
+    if v >= 64:
+        return 1
+    return 0
+
+
+def tc_color(vmax, invest=False):
+    if invest:
+        return TC_PALETTE["Invest"]
+    cat = category(vmax)
+    if cat >= 1:
+        return TC_PALETTE[f"Cat {cat}"]
+    return TC_PALETTE["Trop. Storm"] if (vmax or 0) >= 34 else TC_PALETTE["Depression"]
+
+
+def classify_tc(vmax, stype, basin, invest=False):
+    if invest:
+        return "Invest / Area of Interest"
+    v = vmax or 0
+    cat = category(v)
+    special = {
+        "EX": "Post-Tropical Cyclone",
+        "SS": "Subtropical Storm",
+        "SD": "Subtropical Depression",
+        "LO": "Remnant Low",
+        "DB": "Disturbance",
+        "WV": "Tropical Wave",
+    }
+    if stype in special:
+        return special[stype]
+    if cat >= 1:
+        if basin == "west_pacific":
+            return "Super Typhoon" if v >= 130 else "Typhoon"
+        if basin in ("north_indian", "south_indian", "australia", "south_pacific"):
+            return f"Cyclone (Cat {cat})"
+        return f"Hurricane (Cat {cat})"
+    if v >= 34:
+        return "Tropical Storm"
+    return "Tropical Depression"
+
+
+_COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def movement(track, times):
+    if len(track) < 2 or len(times) < 2:
+        return "—"
+    (lon1, lat1), (lon2, lat2) = track[-2], track[-1]
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
+    brg = (math.degrees(math.atan2(y, x)) + 360) % 360
+    comp = _COMPASS[round(brg / 22.5) % 16]
+    a = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2)
+    dist = 3440.065 * 2 * math.asin(math.sqrt(a))
     try:
-        dt = dtparser.parse(value)
-        if not dt.tzinfo:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        hrs = (times[-1] - times[-2]).total_seconds() / 3600
+        return f"{comp} at {dist / hrs:.0f} kt" if hrs else comp
+    except Exception:
+        return comp
+
+
+def cone_polygon(forecast, basin):
+    try:
+        from tropycal import utils
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        cone = utils.generate_nhc_cone(forecast, basin, cone_days=5)
+        grid = np.asarray(cone["cone"], dtype=float)
+        cs = plt.contour(np.asarray(cone["lon"]), np.asarray(cone["lat"]), grid, levels=[0.5])
+        best = max(cs.allsegs[0], key=len) if cs.allsegs[0] else None
+        plt.close("all")
+        if best is None or len(best) < 3:
+            return None
+        return [[float(x), float(y)] for x, y in best]
     except Exception:
         return None
 
 
-def parse_entry_dt(entry):
-    for key in ["published", "updated", "created"]:
-        dt = parse_dt(entry.get(key))
-        if dt:
-            return dt
-    for key in ["published_parsed", "updated_parsed"]:
-        if entry.get(key):
-            try:
-                return datetime(*entry[key][:6], tzinfo=timezone.utc)
-            except Exception:
-                pass
-    return None
-
-
-def age_label(dt):
-    if not dt:
-        return "Unknown"
-    secs = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
-    days, rem = divmod(secs, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    if days > 0:
-        return f"{days}d {hours}h ago"
-    if hours > 0:
-        return f"{hours}h {minutes}m ago"
-    return f"{minutes}m ago"
-
-
-# --- Local time (Bermuda) formatting ----------------------------------------
-# The user is in Bermuda and prefers local time with AM/PM over UTC 24-hour.
-# Bermuda observes Atlantic Time: ADT (UTC-3) in summer, AST (UTC-4) in winter.
-# Prefer the tz database when available; otherwise fall back to US DST rules
-# (Bermuda follows the same second-Sunday-March to first-Sunday-November rule).
-try:
-    from zoneinfo import ZoneInfo
-    _BERMUDA_TZ = ZoneInfo("Atlantic/Bermuda")
-except Exception:
-    _BERMUDA_TZ = None
-
-
-def _us_dst_active(dt_utc):
-    """True if US/Bermuda daylight time is in effect for the given UTC datetime."""
-    year = dt_utc.year
-    march = datetime(year, 3, 8, tzinfo=timezone.utc)   # earliest 2nd Sunday
-    while march.weekday() != 6:                          # 6 == Sunday
-        march += timedelta(days=1)
-    nov = datetime(year, 11, 1, tzinfo=timezone.utc)     # earliest 1st Sunday
-    while nov.weekday() != 6:
-        nov += timedelta(days=1)
-    return march <= dt_utc < nov
-
-
-def _coerce_utc_dt(value):
-    if value is None:
+def forecast_outlook(fc, cur_vmax, basin):
+    try:
+        fhrs = list(fc.get("fhr", []))
+        vmaxs = list(fc.get("vmax", []))
+        pairs = [(h, v) for h, v in zip(fhrs, vmaxs) if v is not None]
+        if not pairs:
+            return None
+        init = fc.get("init")
+        peak_v = max(v for _, v in pairs)
+        peak_klass = classify_tc(peak_v, None, basin)
+        by = ""
+        for h, v in pairs:
+            if classify_tc(v, None, basin) == peak_klass:
+                if init is not None:
+                    try:
+                        by = fmt_bermuda(init + timedelta(hours=int(h)))
+                    except Exception:
+                        by = f"+{int(h)}h"
+                else:
+                    by = f"+{int(h)}h"
+                break
+        final_v = pairs[-1][1]
+        if cur_vmax and peak_v >= cur_vmax + 5:
+            trend = "↑ strengthening"
+        elif cur_vmax and final_v <= cur_vmax - 5:
+            trend = "↓ weakening"
+        else:
+            trend = "→ steady"
+        return {"peak_klass": peak_klass, "peak_v": peak_v, "by": by, "trend": trend}
+    except Exception:
         return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if hasattr(value, "to_pydatetime"):
+
+
+def _attr(s, key):
+    v = getattr(s, key, None)
+    if v is None and hasattr(s, "attrs"):
         try:
-            dt = value.to_pydatetime()
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            v = s.attrs.get(key)
         except Exception:
-            pass
-    return parse_dt(str(value))
+            v = None
+    return v
 
 
-def format_local_time(value, with_date=True):
-    """Format a UTC time as Bermuda local time, e.g. '17 Aug 2026 · 8:41 AM ADT'."""
-    dt = _coerce_utc_dt(value)
-    if dt is None:
-        return "Time unavailable"
-    if _BERMUDA_TZ is not None:
-        local = dt.astimezone(_BERMUDA_TZ)
-        abbr = local.tzname() or "AST"
-    else:
-        dst = _us_dst_active(dt.astimezone(timezone.utc))
-        local = dt.astimezone(timezone(timedelta(hours=-3 if dst else -4)))
-        abbr = "ADT" if dst else "AST"
-    hour12 = local.hour % 12 or 12
-    ampm = "AM" if local.hour < 12 else "PM"
-    clock = f"{hour12}:{local.minute:02d} {ampm} {abbr}"
-    return f"{local.day} {local.strftime('%b %Y')} · {clock}" if with_date else clock
+def _formation_prob(s):
+    def num(*keys):
+        for k in keys:
+            v = _attr(s, k)
+            if isinstance(v, (int, float)):
+                return int(v)
+            if isinstance(v, str) and v.strip().rstrip("%").isdigit():
+                return int(v.strip().rstrip("%"))
+        return None
+
+    risk = ""
+    for k in ("risk_7day", "risk_5day", "risk_2day"):
+        v = _attr(s, k)
+        if isinstance(v, str) and v not in ("", "N/A"):
+            risk = v
+            break
+    return {"p2": num("prob_2day"), "p7": num("prob_7day", "prob_5day"), "risk": risk}
 
 
-def is_outlook(raw_title, summary):
-    text = f"{raw_title} {summary}".lower()
-    return ("tropical weather outlook" in text) or raw_title.strip().lower() == "tropical cyclone center"
-
-
-def outlook_basin(summary):
-    low = summary.lower()
-    if "atlantic" in low or "caribbean" in low:
-        return "Atlantic"
-    if "eastern" in low and "pacific" in low:
-        return "East Pacific"
-    if "central" in low and "pacific" in low:
-        return "Central Pacific"
-    if "pacific" in low:
-        return "Pacific"
-    return ""
-
-
-def parse_outlook_systems(summary):
-    parts = list(re.finditer(r"\(([A-Z]{2}9\d)\)", summary))
+def _read_tropycal(rt, want_cone, source="NHC"):
     systems = []
-    for i, m in enumerate(parts):
-        code = m.group(1).upper()
-        start = m.end()
-        end = parts[i + 1].start() if i + 1 < len(parts) else len(summary)
-        block = summary[start:end]
-        pcts = [int(x) for x in re.findall(r"(\d{1,3})\s*percent", block, flags=re.IGNORECASE)]
-        pcts = [p for p in pcts if 0 <= p <= 100]
-        systems.append((code, max(pcts) if pcts else None))
+    for sid in rt.list_active_storms():
+        try:
+            s = rt.get_storm(sid)
+            track = [[float(lo), float(la)] for lo, la in zip(s.lon, s.lat)]
+            if not track:
+                continue
+            times = list(getattr(s, "date", []) or getattr(s, "time", []))
+            vmax = float(s.vmax[-1]) if len(getattr(s, "vmax", [])) else 0.0
+            stype = s.type[-1] if getattr(s, "type", None) is not None else None
+            basin = getattr(s, "basin", None)
+            invest = bool(getattr(s, "invest", False))
+            mslp_raw = s.mslp[-1] if getattr(s, "mslp", None) is not None else None
+            mslp = float(mslp_raw) if mslp_raw and not math.isnan(float(mslp_raw)) else None
+
+            fc_track, cone, outlook = [], None, None
+            if not invest:
+                try:
+                    fc = s.get_forecast_realtime()
+                    fc_track = [[float(lo), float(la)] for lo, la in zip(fc["lon"], fc["lat"])]
+                    outlook = forecast_outlook(fc, vmax, basin)
+                    if want_cone and fc_track:
+                        cone = cone_polygon(fc, basin or "north_atlantic")
+                except Exception:
+                    pass
+
+            discussion, nhc_url = None, None
+            if source == "NHC" and not invest:
+                try:
+                    d = s.get_nhc_discussion(forecast=-1)
+                    if isinstance(d, dict):
+                        discussion = d.get("text")
+                        nhc_url = d.get("url")
+                except Exception:
+                    discussion, nhc_url = None, None
+            if source == "NHC" and not nhc_url:
+                nhc_url = "https://www.nhc.noaa.gov/cyclones/"
+
+            klass = classify_tc(vmax, stype, basin, invest)
+            prob = _formation_prob(s) if invest else None
+            updated = times[-1] if times else None
+            systems.append({
+                "id": sid,
+                "event_id": f"TC|{source}|{sid}",
+                "source": source,
+                "peril": "Tropical Cyclone",
+                "name": str(s.name).title(),
+                "title": str(s.name).title(),
+                "summary": "",
+                "basin": basin,
+                "invest": invest,
+                "track": track,
+                "pos": track[-1],
+                "lat": track[-1][1],
+                "lon": track[-1][0],
+                "fc_track": ([track[-1]] + fc_track) if fc_track else [],
+                "cone": cone,
+                "outlook": outlook,
+                "discussion": discussion,
+                "url": nhc_url,
+                "prob": prob,
+                "vmax": vmax,
+                "mslp": mslp,
+                "klass": klass,
+                "cat": category(vmax),
+                "move": movement(track, times),
+                "updated_utc": updated,
+                "time": fmt_bermuda(updated) if updated else "—",
+                "severity": tc_severity(vmax, invest),
+                "alert_level": "Unknown",
+                "color": tc_color(vmax, invest),
+            })
+        except Exception:
+            continue
     return systems
 
 
-def extract_formation_chances(summary):
-    """Return each NHC disturbance code and its stated maximum formation chance."""
-    return {code: chance for code, chance in parse_outlook_systems(summary)}
+def tc_severity(vmax, invest=False):
+    if invest:
+        return "Info"
+    if (vmax or 0) >= 96:
+        return "Critical"
+    if (vmax or 0) >= 64:
+        return "Watch"
+    if (vmax or 0) >= 34:
+        return "Advisory"
+    return "Info"
 
 
-def clean_tc_status_text(text):
-    """Remove Hurricane Center boilerplate before classifying a storm."""
-    text = text or ""
-    for item in [
-        "National Hurricane Center", "NWS National Hurricane Center",
-        "Central Pacific Hurricane Center", "NWS Central Pacific Hurricane Center",
-        "Hurricane Center Honolulu", "Hurricane Center Miami",
-    ]:
-        text = re.sub(re.escape(item), "", text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def title_case_storm_token(token):
-    token = (token or "").strip(" .,-")
-    if not token:
-        return ""
-    out = []
-    for part in token.split("-"):
-        if part.isdigit():
-            out.append(part)
-        elif len(part) == 1:
-            out.append(part.upper())
-        else:
-            out.append(part[:1].upper() + part[1:].lower())
-    return "-".join(out)
-
-
-def extract_tc_identity(raw_title, summary=""):
-    """Return a readable storm/invest identifier such as One-C, Cristobal, AL032026, or EP91."""
-    text = f"{raw_title or ''} {summary or ''}"
-    patterns = [
-        r"\b(?:potential tropical cyclone|post-tropical cyclone|tropical cyclone|tropical storm|tropical depression|major hurricane|hurricane|typhoon|cyclone|storm)\s+([A-Z][A-Za-z]+(?:-[A-Z0-9]+)?|[A-Z]{2}\d{2,4})\b",
-        r"\b([A-Z][A-Z]+)-\d{2}\b",
-        r"\b([A-Z]{2}9\d)\b",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if m:
-            ident = m.group(1).strip()
-            if ident.lower() not in {"warning", "watch", "outlook", "advisory", "public", "discussion", "center"}:
-                return title_case_storm_token(ident)
-    return ""
-
-
-def extract_nhc_product_type(raw_title, summary="", link=""):
-    text = f"{raw_title or ''} {summary or ''} {link or ''}".lower()
-    checks = [
-        ("Tropical Weather Outlook", ["tropical weather outlook", "twoat", "twoep", "twocp", "gtwo"]),
-        ("Discussion", ["discussion"]),
-        ("Public Advisory", ["public advisory"]),
-        ("Forecast/Advisory", ["forecast/advisory", "forecast advisory"]),
-        ("Wind Probabilities", ["wind speed probabilities", "wind probabilities"]),
-        ("Advisory", ["advisory"]),
-    ]
-    for label, terms in checks:
-        if any(term in text for term in terms):
-            return label
-    return "NHC Product"
-
-
-def build_tc_title(raw_title, summary="", status="", wind=None):
-    ident = extract_tc_identity(raw_title, summary)
-    basin = extract_basin(raw_title, summary) or outlook_basin(summary)
-    status = status or extract_storm_status(f"{raw_title or ''} {summary or ''}") or "Tropical Cyclone"
-    if ident:
-        head = f"Tropical Cyclone {ident}" if status in {"", "Invest"} else f"{status} {ident}"
-    else:
-        head = status or "Tropical Cyclone"
-    wind_txt = f"{wind:g} km/h" if wind else ""
-    tail = " - ".join([p for p in [wind_txt, basin] if p])
-    return f"{head} - {tail}" if tail else head
-
-
-def clean_optional_text(value):
-    """Return blank for missing values, including pandas NaN/NaT."""
-    if value is None:
-        return ""
+@st.cache_data(ttl=600, show_spinner="Loading NHC storms...")
+def get_nhc():
     try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    text = str(value).strip()
-    return "" if text.lower() in {"nan", "none", "nat"} else text
+        return _read_tropycal(realtime.Realtime(), want_cone=True, source="NHC")
+    except Exception:
+        return []
 
 
-def extract_nhc_storm_name(raw_title, summary=""):
-    """Extract a named NHC storm without treating forecast prose as its name."""
-    raw_title = clean_optional_text(raw_title)
-    summary = clean_optional_text(summary)
-    status_terms = (
-        "potential tropical cyclone|post-tropical cyclone|tropical storm|"
-        "tropical depression|major hurricane|hurricane"
-    )
-    stop_words = {
-        "a", "an", "as", "at", "for", "in", "is", "it", "near", "of", "on",
-        "the", "to", "warning", "watch", "outlook", "advisory", "discussion",
-        "forecast", "probabilities", "center", "product",
-    }
-
-    # Product titles are the safest source: "Tropical Storm Lala ..."
-    match = re.search(
-        rf"\b(?:{status_terms})\s+([A-Z][A-Za-z-]+)\b",
-        raw_title,
-        flags=re.IGNORECASE,
-    )
-    if match and match.group(1).casefold() not in stop_words:
-        return title_case_storm_token(match.group(1))
-
-    # NHC bulletin headlines often use "LALA FORECAST/ADVISORY...".
-    match = re.search(
-        r"(?:^|[. ]{2,})([A-Z][A-Z-]{2,})\s+"
-        r"(?:FORECAST|ADVISORY|DISCUSSION|WIND|PUBLIC)\b",
-        summary,
-    )
-    if match and match.group(1).casefold() not in stop_words:
-        return title_case_storm_token(match.group(1))
-
-    # Explicit status + name in the summary is acceptable only when it is not
-    # preceded by forecast language such as "become a hurricane as...".
-    for match in re.finditer(
-        rf"\b(?:{status_terms})\s+([A-Z][A-Za-z-]+)\b",
-        summary,
-        flags=re.IGNORECASE,
-    ):
-        candidate = match.group(1)
-        prefix = summary[max(0, match.start() - 35):match.start()].casefold()
-        if candidate.casefold() in stop_words:
-            continue
-        if re.search(r"(?:forecast|expected|potential|could|may|likely)\s+(?:to\s+)?(?:become|strengthen|intensify)?\s*$", prefix):
-            continue
-        return title_case_storm_token(candidate)
-    return ""
+@st.cache_resource(ttl=600)
+def jtwc_state():
+    return {"data": None, "started": False}
 
 
-def extract_current_storm_status(raw_title, summary=""):
-    """Extract the storm's stated current status, excluding forecast wording."""
-    raw_title = clean_optional_text(raw_title)
-    summary = clean_optional_text(summary)
-    ordered = [
-        ("Post-Tropical Cyclone", r"post-tropical cyclone"),
-        ("Major Hurricane", r"major hurricane"),
-        ("Hurricane", r"hurricane"),
-        ("Tropical Storm", r"tropical storm"),
-        ("Tropical Depression", r"tropical depression"),
-        ("Potential Tropical Cyclone", r"potential tropical cyclone"),
-    ]
-    # The product title states what the system currently is.
-    for label, pattern in ordered:
-        if re.search(rf"\b{pattern}\b", raw_title, flags=re.IGNORECASE):
-            return label
-    # Advisory headers can also state the current classification. Ignore any
-    # match immediately associated with forecast/expected language.
-    for label, pattern in ordered:
-        for match in re.finditer(rf"\b{pattern}\b", summary, flags=re.IGNORECASE):
-            prefix = summary[max(0, match.start() - 40):match.start()].casefold()
-            if re.search(r"(?:forecast|expected|could|may|likely)\s+(?:to\s+)?(?:become|strengthen|intensify)?\s*$", prefix):
-                continue
-            suffix = summary[match.end():match.end() + 45]
-            if re.match(r"\s+[A-Z][A-Za-z-]+\b", suffix):
-                return label
-    return ""
+def get_tropical_systems():
+    nhc = get_nhc()
+    state = jtwc_state()
+    if not state["started"]:
+        state["started"] = True
+
+        def bg():
+            try:
+                state["data"] = _read_tropycal(
+                    realtime.Realtime(jtwc=True, jtwc_source="ucar"),
+                    want_cone=True,
+                    source="JTWC",
+                )
+            except Exception:
+                state["data"] = []
+
+        threading.Thread(target=bg, daemon=True).start()
+    out = list(nhc)
+    if state["data"]:
+        have = {s["id"] for s in out}
+        out += [s for s in state["data"] if s["id"] not in have]
+    loading = state["data"] is None
+    out.sort(key=lambda s: (s["invest"], -s["vmax"]))
+    return out, loading
+
+# ---------------------------------------------------------------------------
+# Optional Gemini brief for tropical cyclones
+# ---------------------------------------------------------------------------
 
 
-def extract_forecast_status(text):
-    """Return a forecast classification separately from the current status."""
-    text = clean_optional_text(text)
-    patterns = [
-        ("Major Hurricane", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?major hurricane"),
-        ("Hurricane", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?hurricane"),
-        ("Tropical Storm", r"(?:forecast|expected|likely)\s+to\s+(?:become|strengthen|intensify)(?:\s+into)?\s+(?:a\s+)?tropical storm"),
-    ]
-    for label, pattern in patterns:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return label
-    return ""
-
-
-def extract_forecast_timing(text):
-    """When an intensification is forecast, capture the expected timing, e.g.
-    'by Wednesday' or 'within 48h'. Scoped to the intensification clause so
-    unrelated dates in the bulletin (movement turns, etc.) are not picked up."""
-    text = clean_optional_text(text)
-    if not text:
-        return ""
-    clause = re.search(
-        r"(?:forecast|expected|likely)\s+to\s+"
-        r"(?:become|strengthen|intensify|re-?strengthen)[^.]*",
-        text, flags=re.IGNORECASE,
-    )
-    scope = clause.group(0) if clause else ""
-    if not scope:
-        clause = re.search(r"re-?strengthening[^.]*", text, flags=re.IGNORECASE)
-        scope = clause.group(0) if clause else ""
-    if not scope:
-        return ""
-    m = re.search(
-        r"\bby\s+(?:late\s+|early\s+)?(Monday|Tuesday|Wednesday|Thursday|Friday|"
-        r"Saturday|Sunday|tonight|tomorrow|this evening|this morning|midweek)\b",
-        scope, flags=re.IGNORECASE,
-    )
-    if m:
-        return f"by {m.group(1)}"
-    m = re.search(r"\bwithin\s+(?:the\s+next\s+)?(\d{1,3})\s*hours", scope, flags=re.IGNORECASE)
-    if m:
-        return f"within {m.group(1)}h"
-    return ""
-
-
-def nhc_active_storm_key(row):
-    if row.get("source") != "NHC" or row.get("peril") != "Tropical Cyclone":
-        return ""
-    raw_title = clean_optional_text(row.get("raw_title"))
-    summary = clean_optional_text(row.get("summary"))
-    if is_outlook(raw_title, summary):
+def gemini_key():
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
         return ""
 
-    storm_name = extract_nhc_storm_name(raw_title, summary)
-    if storm_name:
-        return f"NHC|NAME|{storm_name.casefold()}"
 
-    atcf_id = clean_optional_text(row.get("atcf_id"))
-    if atcf_id:
-        return f"ATCF|{atcf_id.upper()}"
-    return ""
-
-
-def cross_source_tc_key(row):
-    """Source-agnostic identity for a named tropical cyclone.
-
-    Lets a storm tracked by both NHC and GDACS collapse to a single card. Uses
-    the storm name shared across providers (e.g. NHC "Hurricane Kiko" and GDACS
-    "tropical cyclone KIKO-25"). Invests/basin codes and unnamed systems return
-    an empty string so they are never merged across sources, which keeps NW
-    Pacific typhoons that only GDACS carries intact.
-    """
-    if row.get("peril") != "Tropical Cyclone":
-        return ""
-    raw_title = clean_optional_text(row.get("raw_title"))
-    summary = clean_optional_text(row.get("summary"))
-    if is_outlook(raw_title, summary):
-        return ""
-    name = extract_nhc_storm_name(raw_title, summary) or extract_tc_identity(raw_title, summary)
-    name = re.sub(r"-\d+$", "", name or "").strip()  # strip GDACS year suffix, KIKO-25 -> KIKO
-    if not name:
-        return ""
-    # Exclude invest/basin codes such as EP91 or AL93 which are not shared names.
-    if re.fullmatch(r"[A-Z]{2}9\d", name.upper()):
-        return ""
-    return f"TCNAME|{name.casefold()}"
-
-
-def extract_atcf_id(text):
-    """Extract an ATCF identifier such as AL032026 from text or a URL."""
-    m = re.search(r"\b([A-Z]{2}\d{2}\d{4})\b", text or "", flags=re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-    m = re.search(r"/(?:al|ep|cp)(\d{2})(\d{4})", text or "", flags=re.IGNORECASE)
-    if m:
-        prefix = re.search(r"/(al|ep|cp)", text, flags=re.IGNORECASE).group(1).upper()
-        return f"{prefix}{m.group(1)}{m.group(2)}"
-    return ""
-
-
-def extract_storm_status(text):
-    low = clean_tc_status_text(text).lower()
-    ordered = [
-        ("Post-Tropical Cyclone", ["post-tropical cyclone"]),
-        ("Major Hurricane", ["major hurricane", "category 3", "category 4", "category 5"]),
-        ("Hurricane", ["hurricane"]),
-        ("Typhoon", ["typhoon"]),
-        ("Tropical Storm", ["tropical storm"]),
-        ("Tropical Depression", ["tropical depression"]),
-        ("Potential Tropical Cyclone", ["potential tropical cyclone"]),
-        ("Invest", ["invest", "disturbance"]),
-    ]
-    for status, terms in ordered:
-        if any(term in low for term in terms):
-            return status
-    return ""
-
-
-def extract_pressure_mb(text):
-    m = re.search(r"(?:minimum central pressure|pressure)\D{0,15}(\d{3,4})\s*(?:mb|hpa)", text or "", flags=re.IGNORECASE)
-    return float(m.group(1)) if m else None
-
-
-def extract_advisory_number(text):
-    m = re.search(r"advisory\s+(?:number\s+)?(\d+[A-Z]?)", text or "", flags=re.IGNORECASE)
-    return m.group(1).upper() if m else ""
-
-
-def extract_movement(text):
-    m = re.search(r"(?:moving|movement)\s*:?\s*([A-Z-]+)(?:\s+or\s+\d+\s+degrees)?\s+(?:at|near)\s+(\d+(?:\.\d+)?)\s*(mph|km/h|kt|knots)", text or "", flags=re.IGNORECASE)
-    if not m:
-        return "", None
-    direction, speed, unit = m.group(1).upper(), float(m.group(2)), m.group(3).lower()
-    if unit == "mph":
-        speed *= 1.60934
-    elif unit in ("kt", "knots"):
-        speed *= 1.852
-    return direction, speed
-
-
-def extract_wind_kmh_any(text):
-    value = extract_wind_kmh(text)
-    if value is not None:
-        return value
-    m = re.search(r"(?:maximum sustained winds?|max sustained)\D{0,20}(\d+(?:\.\d+)?)\s*(mph|kt|knots)", text or "", flags=re.IGNORECASE)
-    if not m:
+@st.cache_resource(show_spinner=False)
+def gemini_client():
+    if genai is None or not gemini_key():
         return None
-    value, unit = float(m.group(1)), m.group(2).lower()
-    return value * (1.60934 if unit == "mph" else 1.852)
+    try:
+        return genai.Client(api_key=gemini_key())
+    except Exception:
+        return None
 
 
-def infer_peril(title, summary, default_peril):
+_AI_ERROR = {"msg": ""}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def gemini_model():
+    client = gemini_client()
+    if client is None:
+        return None
+    try:
+        available = [m.name.replace("models/", "") for m in client.models.list()]
+    except Exception as e:
+        _AI_ERROR["msg"] = f"models.list failed: {type(e).__name__}: {str(e)[:150]}"
+        return "gemini-2.5-flash"
+    for pref in GEMINI_MODELS:
+        if pref in available:
+            return pref
+    flash = [n for n in available if "flash" in n and not any(x in n for x in ("image", "tts", "live", "lite"))]
+    if flash:
+        return sorted(flash, reverse=True)[0]
+    return "gemini-2.5-flash"
+
+
+def storm_facts(s):
+    bits = [s["name"], s["klass"]]
+    if s.get("vmax"):
+        bits.append(f"{s['vmax']:.0f} kt winds")
+    if s.get("mslp"):
+        bits.append(f"{s['mslp']:.0f} mb")
+    if s.get("move") and s["move"] != "—":
+        bits.append(f"moving {s['move']}")
+    fo = s.get("outlook")
+    if fo:
+        if fo["peak_klass"] != s["klass"] and fo["by"]:
+            bits.append(f"forecast to reach {fo['peak_klass']} by {fo['by']}")
+        bits.append(fo["trend"].split(" ", 1)[-1])
+    return "; ".join(bits)
+
+
+def fallback_brief(s):
+    head = f"{s['name']} is a {s['klass'].lower()}"
+    if s.get("vmax"):
+        head += f" with {s['vmax']:.0f} kt winds"
+    parts = [head]
+    if s.get("move") and s["move"] != "—":
+        parts.append(f"moving {s['move']}")
+    fo = s.get("outlook")
+    if fo and fo["peak_klass"] != s["klass"] and fo["by"]:
+        parts.append(f"forecast to reach {fo['peak_klass'].lower()} by {fo['by']}")
+    return ", ".join(parts) + "."
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def ai_brief(facts, discussion=None):
+    client, model = gemini_client(), gemini_model()
+    if client is None or not model:
+        return None
+    if discussion:
+        prompt = (
+            "You are briefing a reinsurance underwriter. Read this official NHC forecast "
+            "discussion and give ONE concise, plain sentence capturing what the storm is "
+            "doing now and the key forecast threat. No preamble, no lists.\n\nDISCUSSION:\n"
+            + discussion[:6000]
+        )
+    else:
+        prompt = (
+            "You are briefing a reinsurance underwriter. In ONE concise, plain sentence, "
+            "state what this tropical system is doing now and its key forecast. No preamble, no lists.\nFacts: "
+            + facts
+        )
+    try:
+        resp = client.models.generate_content(model=model, contents=prompt)
+        text = (resp.text or "").strip()
+        return text or None
+    except Exception as e:
+        _AI_ERROR["msg"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return None
+
+# ---------------------------------------------------------------------------
+# GDACS + CAL FIRE - non-tropical-cyclone global perils
+# ---------------------------------------------------------------------------
+
+
+def infer_gdacs_peril(title, summary):
     text = f"{title} {summary}".lower()
-    if any(x in text for x in ["tropical cyclone", "hurricane", "typhoon", "cyclone", "tropical storm", "tropical depression", "disturbance"]):
+    if any(x in text for x in ["tropical cyclone", "hurricane", "typhoon", "cyclone"]):
         return "Tropical Cyclone"
-    if any(x in text for x in ["earthquake", "magnitude", "seismic"]):
+    if any(x in text for x in ["earthquake", "magnitude", " seismic", "m "]):
         return "Earthquake"
     if "flood" in text:
         return "Flood"
-    if any(x in text for x in ["wildfire", "forest fire", "bushfire", "wild fire"]):
+    if any(x in text for x in ["forest fire", "wildfire", "wild fire", "bushfire"]):
         return "Wildfire"
     if any(x in text for x in ["volcano", "eruption", "volcanic"]):
         return "Volcano"
     if "drought" in text:
         return "Drought"
-    if default_peril != "All":
-        return default_peril
     return "Other"
 
 
@@ -614,9 +671,29 @@ def infer_alert_level(title, summary):
     return "Unknown"
 
 
+def severity_from_alert(alert, peril="Other", magnitude=None):
+    if alert == "Red":
+        return "Critical"
+    if alert == "Orange":
+        return "Watch"
+    if alert == "Green":
+        return "Advisory"
+    if peril == "Earthquake" and magnitude is not None:
+        if magnitude >= 7.0:
+            return "Watch"
+        if magnitude >= 6.0:
+            return "Advisory"
+    return "Info"
+
+
 def extract_magnitude(text):
-    for pattern in [r"magnitude\s*([0-9]+(?:\.[0-9]+)?)", r"\bM\s*([0-9]+(?:\.[0-9]+)?)\b"]:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
+    patterns = [
+        r"\bM\s*([0-9]+(?:\.[0-9]+)?)\b",
+        r"magnitude\s*([0-9]+(?:\.[0-9]+)?)",
+        r"earthquake[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text or "", flags=re.IGNORECASE)
         if m:
             try:
                 return float(m.group(1))
@@ -625,2230 +702,533 @@ def extract_magnitude(text):
     return None
 
 
-def extract_wind_kmh(text):
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*km/h", text, flags=re.IGNORECASE)
-    if m:
+def extract_acres(item):
+    for key in ("AcresBurned", "Acres", "acres", "AcresBurnedDisplay"):
+        value = item.get(key)
+        if value is None:
+            continue
         try:
-            return float(m.group(1))
+            return float(str(value).replace(",", ""))
         except Exception:
-            return None
+            pass
     return None
 
 
-def _clean_location(loc):
-    loc = loc.strip(" .,-")
-    kept = []
-    for w in re.split(r"\s+", loc):
-        if w in _STOP_LOC_WORDS and kept:
-            break
-        kept.append(w)
-    return " ".join(kept).strip(" .,-")
-
-
-def extract_location(raw_title, summary=""):
-    for text in [raw_title, summary]:
-        if not text:
+def extract_containment(item):
+    for key in ("PercentContained", "Containment", "contained_pct"):
+        value = item.get(key)
+        if value is None:
             continue
-        m = re.search(r"\bin\s+([A-Z][A-Za-z .'\-]+?)(?:\s+\d{1,2}[/-]\d|\s*,|\s*\(|\.|$)", text)
-        if m:
-            loc = _clean_location(m.group(1))
-            if 2 <= len(loc) <= 40:
-                return loc
-    return ""
+        try:
+            return float(str(value).replace("%", ""))
+        except Exception:
+            pass
+    return None
 
 
-def extract_basin(raw_title, summary=""):
-    text = f"{raw_title} {summary}"
-    m = re.search(r"active in\s+([A-Za-z]+)", text, flags=re.IGNORECASE)
-    if not m:
-        m = re.search(r"\bin\s+([A-Za-z]*(?:Pacific|Atlantic|Indian|Bengal|Sea))\b", text, flags=re.IGNORECASE)
-    if m:
-        token = m.group(1)
-        key = token.lower()
-        if key in BASIN_MAP:
-            return BASIN_MAP[key]
-        pretty = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", token)
-        if any(b in pretty for b in ["Pacific", "Atlantic", "Indian", "Bengal", "Sea"]):
-            return pretty
-    return ""
-
-
-def extract_storm_name(raw_title, summary):
-    return extract_tc_identity(raw_title, summary)
-
-def build_display_title(peril, raw_title, summary="", magnitude=None, wind=None):
-    raw_title = (raw_title or "").strip()
-
-    if peril == "Earthquake":
-        loc = extract_location(raw_title, summary)
-        mag_txt = f"M{magnitude:g}" if magnitude else ""
-        if mag_txt and loc:
-            return f"Earthquake {mag_txt} \u2014 {loc}"
-        if mag_txt:
-            return f"Earthquake {mag_txt}"
-        return f"Earthquake \u2014 {loc}" if loc else (raw_title or "Earthquake")
-
-    if peril == "Tropical Cyclone":
-        if is_outlook(raw_title, summary):
-            basin = outlook_basin(summary)
-            head = f"Tropical Weather Outlook - {basin}" if basin else "Tropical Weather Outlook"
-            systems = parse_outlook_systems(summary)
-            if systems:
-                bits = ", ".join(f"{c} {o}%" if o is not None else c for c, o in systems)
-                return f"{head} ({bits})"
-            return head
-        status = extract_storm_status(f"{raw_title} {summary}")
-        return build_tc_title(raw_title, summary, status=status, wind=wind)
-
-    if peril in ("Flood", "Volcano", "Drought", "Wildfire"):
-        loc = extract_location(raw_title, summary)
-        return f"{peril} \u2014 {loc}" if loc else (raw_title or peril)
-
-    loc = extract_location(raw_title, summary)
-    if loc:
-        return f"{peril} \u2014 {loc}"
-    if peril.lower().split()[0] in raw_title.lower():
-        return raw_title
-    return f"{peril}: {raw_title}" if raw_title else peril
-
-
-def infer_tier(row):
-    text = f"{row.get('title','')} {row.get('summary','')}".lower()
-    text = text.replace("national hurricane center", "").replace("hurricane center", "")
-    peril = row.get("peril", "Other")
-    alert = row.get("alert_level", "Unknown")
-    mag = row.get("magnitude")
-    wind = row.get("wind_kmh")
-
-    if alert == "Red":
-        return "Critical"
-    if alert == "Orange":
-        return "Watch"
-    if peril == "Earthquake":
-        if mag and mag >= 7.0:
-            return "Critical"
-        if mag and mag >= 6.0:
-            return "Watch"
-        if mag and mag >= 5.5:
-            return "Advisory"
-    if peril == "Tropical Cyclone":
-        if "tropical weather outlook" in text:
-            return "Advisory"
-        status = clean_optional_text(row.get("status"))
-        if status == "Major Hurricane" or (wind and wind >= 178):
-            return "Critical"
-        if status in {"Hurricane", "Typhoon"} or (wind and wind >= 119):
-            return "Watch"
-        if status in {"Tropical Storm", "Tropical Depression", "Potential Tropical Cyclone", "Invest"}:
-            return "Advisory"
-    if peril in ["Flood", "Volcano", "Wildfire"] and alert in ["Unknown", "Green"]:
-        if any(x in text for x in ["evacuation", "displaced", "fatal", "deaths", "emergency"]):
-            return "Watch"
-    return "Info"
-
-
-def clean_bulletin_text(text):
-    """Turn a raw NHC text product into a clean single-paragraph body.
-
-    NHC bulletins begin with a WMO header block (numeric codes, office, issue
-    time) and end with a forecaster signature after a '$$' line. The material
-    narrative sits between the '...HEADLINE...' line and '$$'. We keep that,
-    collapse whitespace, and drop the boilerplate so downstream extraction and
-    display both work on the real content."""
-    if not text:
-        return ""
-    lines = [ln.rstrip() for ln in text.replace("\r", "").split("\n")]
-    start = 0
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("..."):
-            start = i
-            break
-    body = lines[start:]
-    kept = []
-    for ln in body:
-        if ln.strip() == "$$":  # forecaster signature follows; stop.
-            break
-        kept.append(ln)
-    joined = " ".join(s.strip() for s in kept if s.strip())
-    return re.sub(r"\s+", " ", joined).strip()
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_nhc_product_text(url):
-    """Fetch the full text of an NHC product page (Public Advisory / Forecast
-    Advisory / Discussion). NHC serves these as HTML with the bulletin inside a
-    <pre> block. Returns cleaned narrative text, or '' on any failure so callers
-    transparently fall back to the thin RSS summary. Cached so repeated storm
-    products and refreshes within the TTL do not re-hit the network."""
-    if not url or "nhc.noaa.gov" not in url:
-        return ""
+@st.cache_data(ttl=600, show_spinner="Loading GDACS non-cyclone events...")
+def load_gdacs_events():
+    if feedparser is None:
+        return []
     try:
-        resp = requests.get(url, headers=REQUEST_HEADERS, timeout=12)
-        resp.raise_for_status()
+        parsed = feedparser.parse(GDACS_RSS_URL, request_headers=REQUEST_HEADERS)
     except Exception:
-        return ""
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        pre = soup.find("pre")
-        raw = pre.get_text("\n") if pre else soup.get_text("\n")
-    except Exception:
-        return ""
-    return clean_bulletin_text(raw)
+        return []
 
-
-# --- Optional AI parsing (Gemini) -------------------------------------------
-# The full bulletin text is fed to a small, fast model to produce a clean,
-# structured brief. This is strictly additive: if the API key or library is
-# absent, or anything fails, the app falls back to the regex extraction and the
-# rest of the card is unchanged. The model does basic reading comprehension,
-# not judgement — it restates what the bulletin says in a consistent shape.
-if BaseModel is not None:
-    class StormBrief(BaseModel):
-        current_status: str = Field(default="", description="e.g. Tropical Storm, Hurricane")
-        category: str = Field(default="", description="Saffir-Simpson category if a hurricane, e.g. '1'")
-        forecast_status: str = Field(default="", description="peak status the storm is forecast to reach")
-        forecast_by: str = Field(default="", description="when it is forecast to reach that status, e.g. 'by Wednesday'")
-        landfall_location: str = Field(default="", description="forecast landfall/closest-approach place, if any")
-        landfall_window: str = Field(default="", description="timing of that landfall/approach, if stated")
-        key_threats: list[str] = Field(default_factory=list, description="up to 3 short hazard phrases")
-        underwriter_summary: str = Field(default="", description="one plain sentence an underwriter would say")
-else:
-    StormBrief = None
-
-
-def gemini_available():
-    """True only if the library is importable and an API key is configured."""
-    if genai is None:
-        return False
-    try:
-        return bool(str(st.secrets.get("GEMINI_API_KEY", "")).strip())
-    except Exception:
-        return False
-
-
-@st.cache_resource(show_spinner=False)
-def _gemini_model():
-    """Configure and cache the Gemini model, or None if unavailable."""
-    if not gemini_available():
-        return None
-    try:
-        genai.configure(api_key=str(st.secrets["GEMINI_API_KEY"]).strip())
-        return genai.GenerativeModel(GEMINI_MODEL)
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def ai_storm_brief(bulletin_text, storm_name=""):
-    """Return a structured brief dict for a storm bulletin, or None on any
-    failure. Cached on the bulletin text so each advisory is parsed once. The
-    30-minute TTL and per-text cache keep free-tier usage to a trickle."""
-    text = (bulletin_text or "").strip()
-    if len(text) < 40:
-        return None
-    model = _gemini_model()
-    if model is None:
-        return None
-    prompt = (
-        "You are parsing an official US National Hurricane Center tropical "
-        "cyclone bulletin. Extract ONLY what the text states; never invent "
-        "values; leave a field blank if not stated. Respond with strict JSON "
-        "matching these keys: current_status, category, forecast_status, "
-        "forecast_by, landfall_location, landfall_window, key_threats (array of "
-        "up to 3 short strings), underwriter_summary (one plain sentence a "
-        "reinsurance underwriter would say to a colleague, e.g. 'TS Lala, "
-        "forecast to re-strengthen to a hurricane by Wednesday, moving away "
-        "from Hawaii').\n\n"
-        f"Storm: {storm_name or 'unknown'}\n\nBULLETIN:\n{text[:6000]}"
-    )
-    try:
-        resp = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json", "temperature": 0},
-        )
-        data = json.loads(resp.text)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    # Normalise: coerce to the expected shape defensively.
-    threats = data.get("key_threats") or []
-    if isinstance(threats, str):
-        threats = [threats]
-    return {
-        "current_status": str(data.get("current_status", "")).strip(),
-        "category": str(data.get("category", "")).strip(),
-        "forecast_status": str(data.get("forecast_status", "")).strip(),
-        "forecast_by": str(data.get("forecast_by", "")).strip(),
-        "landfall_location": str(data.get("landfall_location", "")).strip(),
-        "landfall_window": str(data.get("landfall_window", "")).strip(),
-        "key_threats": [str(t).strip() for t in threats if str(t).strip()][:3],
-        "underwriter_summary": str(data.get("underwriter_summary", "")).strip(),
-    }
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_feed(feed):
-    parsed = feedparser.parse(feed["url"], request_headers=REQUEST_HEADERS)
-    rows = []
+    events = []
     for entry in parsed.entries:
         raw_title = clean_html(entry.get("title", ""))
         summary = clean_html(entry.get("summary", entry.get("description", "")))
-        dt = parse_entry_dt(entry)
-        peril = infer_peril(raw_title, summary, feed["default_peril"])
-        link = entry.get("link", feed["url"])
-        # A Tropical Weather Outlook is a basin summary, not a storm, so it must
-        # never carry a lifecycle status. Its prose mentions "National Hurricane
-        # Center" and other systems, which would otherwise be misread as the
-        # outlook itself being a hurricane.
-        is_named_tc_row = peril == "Tropical Cyclone" and not is_outlook(raw_title, summary)
-        product_type = extract_nhc_product_type(raw_title, summary, link) if feed["source"] == "NHC" else ""
+        peril = infer_gdacs_peril(raw_title, summary)
 
-        # STEP 1: For named NHC cyclones, the RSS <description> is a thin summary
-        # that omits the forecast narrative (e.g. "forecast to become a hurricane
-        # by Wednesday"). Fetch the full bulletin from the product link and use
-        # that richer text for extraction, display and storage. Falls back to the
-        # thin summary automatically if the fetch fails or returns nothing.
-        narrative_products = {
-            "Public Advisory", "Forecast/Advisory", "Advisory", "Discussion",
-        }
-        if (feed["source"] == "NHC" and is_named_tc_row
-                and product_type in narrative_products):
-            full_text = fetch_nhc_product_text(link)
-            if full_text:
-                summary = full_text
+        # Intentional: TCs belong only to the Tropycal/NHC/JTWC layer.
+        if peril == "Tropical Cyclone":
+            continue
 
-        combo = f"{raw_title} {summary}"
-        magnitude = extract_magnitude(combo)
-        wind_kmh = extract_wind_kmh_any(combo)
         lat, lon = extract_latlon(entry)
-        atcf_id = extract_atcf_id(f"{combo} {link}")
-        status = extract_current_storm_status(raw_title, summary) if is_named_tc_row else ""
-        forecast_status = extract_forecast_status(combo) if is_named_tc_row else ""
-        forecast_timing = extract_forecast_timing(combo) if is_named_tc_row else ""
-        pressure_mb = extract_pressure_mb(combo)
-        advisory_number = extract_advisory_number(combo)
-        move_direction, move_kmh = extract_movement(combo)
-        row = {
-            "source": feed["source"], "feed": feed["name"], "url": feed["url"],
-            "raw_title": raw_title or "Untitled",
-            "title": build_display_title(peril, raw_title or "Untitled item", summary, magnitude, wind_kmh),
-            "summary": summary, "link": link,
-            "published_utc": dt,
-            "published": dt.strftime("%Y-%m-%d %H:%M UTC") if dt else "Unknown",
-            "age": age_label(dt), "peril": peril,
-            "alert_level": infer_alert_level(raw_title, summary),
-            "magnitude": magnitude, "wind_kmh": wind_kmh,
-            "status": status, "forecast_status": forecast_status,
-            "forecast_timing": forecast_timing,
-            "atcf_id": atcf_id, "pressure_mb": pressure_mb,
-            "advisory_number": advisory_number, "move_direction": move_direction,
-            "move_kmh": move_kmh, "formation_chance": None,
-            "disturbance_code": "", "acres": None, "contained_pct": None,
-            "lat": lat, "lon": lon, "product_type": product_type,
-            "source_product_count": 1, "source_products": product_type,
-        }
-        row["tier"] = infer_tier(row)
-        systems = extract_formation_chances(summary) if is_outlook(raw_title, summary) else {}
-        if systems:
-            for code, chance in systems.items():
-                system_row = dict(row)
-                system_row["disturbance_code"] = code
-                system_row["formation_chance"] = chance
-                system_row["status"] = "Invest"
-                system_row["raw_title"] = f"{code} Tropical Disturbance"
-                system_row["title"] = f"Tropical Disturbance {code}" + (f" - {chance}% formation chance" if chance is not None else "")
-                system_row["link"] = link
-                rows.append(system_row)
-        else:
-            rows.append(row)
-    return rows
+        published = parse_entry_dt(entry)
+        link = entry.get("link", GDACS_RSS_URL)
+        alert = infer_alert_level(raw_title, summary)
+        mag = extract_magnitude(f"{raw_title} {summary}")
+        severity = severity_from_alert(alert, peril, mag)
+        color = SEVERITY_COLOR.get(severity, SEVERITY_COLOR["Info"])
+
+        metric_bits = []
+        if mag is not None:
+            metric_bits.append(f"M{mag:.1f}")
+        if alert != "Unknown":
+            metric_bits.append(f"{alert} alert")
+
+        events.append({
+            "event_id": f"GDACS|{link or raw_title}",
+            "source": "GDACS",
+            "peril": peril,
+            "title": raw_title or f"{peril} event",
+            "summary": summary,
+            "severity": severity,
+            "alert_level": alert,
+            "lat": lat,
+            "lon": lon,
+            "published_utc": published,
+            "updated_utc": published,
+            "time": fmt_bermuda(published) if published else "—",
+            "age": age_label(published),
+            "url": link,
+            "metrics": {"magnitude": mag, "alert": alert},
+            "metric_text": " · ".join(metric_bits),
+            "color": color,
+        })
+    events.sort(key=lambda e: (severity_rank(e["severity"]), ALERT_ORDER.get(e["alert_level"], 9), e.get("published_utc") or datetime.min.replace(tzinfo=timezone.utc)))
+    return events
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_calfire():
-    rows = []
+@st.cache_data(ttl=900, show_spinner="Loading CAL FIRE incidents...")
+def load_calfire_events():
     try:
         resp = requests.get(CALFIRE_URL, headers=REQUEST_HEADERS, timeout=20)
         resp.raise_for_status()
         incidents = resp.json()
-    except Exception as exc:
-        return [{
-            "source": "CAL FIRE", "feed": "CAL FIRE Incidents", "url": CALFIRE_URL,
-            "raw_title": "CAL FIRE feed unavailable", "title": "Wildfire: CAL FIRE feed unavailable",
-            "summary": str(exc), "link": "https://www.fire.ca.gov/incidents",
-            "published_utc": None, "published": "Unknown", "age": "Unknown",
-            "peril": "Wildfire", "alert_level": "Unknown", "magnitude": None,
-            "wind_kmh": None, "lat": None, "lon": None, "tier": "Info",
-        }]
+    except Exception:
+        return []
 
-    for inc in incidents:
-        name = inc.get("Name", "Unnamed incident")
-        county = inc.get("County", "")
-        location = inc.get("Location", "")
-        acres = inc.get("AcresBurned")
-        contained = inc.get("PercentContained")
-        updated = parse_dt(inc.get("Updated")) or parse_dt(inc.get("Started"))
-        url = inc.get("Url") or "https://www.fire.ca.gov/incidents"
-        lat = to_float(inc.get("Latitude"))
-        lon = to_float(inc.get("Longitude"))
-        if lat == 0 and lon == 0:
-            lat = lon = None
+    events = []
+    for item in incidents if isinstance(incidents, list) else []:
+        name = item.get("Name") or item.get("IncidentName") or "California wildfire"
+        lat = to_float(item.get("Latitude") or item.get("lat"))
+        lon = to_float(item.get("Longitude") or item.get("lon"))
+        acres = extract_acres(item)
+        contained = extract_containment(item)
+        updated = parse_dt(item.get("Updated") or item.get("LastUpdated") or item.get("Started"))
+        url = item.get("Url") or item.get("Link") or "https://www.fire.ca.gov/incidents"
+        if url and url.startswith("/"):
+            url = "https://www.fire.ca.gov" + url
 
-        acres_txt = f"{int(acres):,} acres" if isinstance(acres, (int, float)) else "acres n/a"
-        cont_txt = f"{int(contained)}% contained" if isinstance(contained, (int, float)) else "containment n/a"
-        county_txt = f"{county} County" if county else location
-
-        title = f"Wildfire: {name} (CA, {county_txt}) - {acres_txt}, {cont_txt}"
-        summary = f"California, USA. Location: {location or county_txt}. {acres_txt}. {cont_txt}."
-
-        if isinstance(acres, (int, float)) and acres >= 10000 and (not isinstance(contained, (int, float)) or contained < 50):
-            tier = "Critical"
-        elif isinstance(acres, (int, float)) and acres >= 1000:
-            tier = "Watch"
-        elif isinstance(acres, (int, float)) and acres >= 100:
-            tier = "Advisory"
+        if acres and acres >= 100000:
+            severity = "Critical"
+        elif acres and acres >= 10000:
+            severity = "Watch"
+        elif acres and acres >= 1000:
+            severity = "Advisory"
         else:
-            tier = "Info"
+            severity = "Info"
 
-        rows.append({
-            "source": "CAL FIRE", "feed": "CAL FIRE Incidents", "url": CALFIRE_URL,
-            "raw_title": name, "title": title, "summary": summary, "link": url,
+        metric_bits = []
+        if acres is not None:
+            metric_bits.append(f"{acres:,.0f} acres")
+        if contained is not None:
+            metric_bits.append(f"{contained:.0f}% contained")
+
+        location = item.get("County") or item.get("Location") or "California"
+        summary = " · ".join([x for x in [str(location), " · ".join(metric_bits)] if x])
+
+        events.append({
+            "event_id": f"CALFIRE|{name}".lower(),
+            "source": "CAL FIRE",
+            "peril": "Wildfire",
+            "title": f"{name} fire",
+            "summary": summary,
+            "severity": severity,
+            "alert_level": "Unknown",
+            "lat": lat,
+            "lon": lon,
             "published_utc": updated,
-            "published": updated.strftime("%Y-%m-%d %H:%M UTC") if updated else "Unknown",
-            "age": age_label(updated), "peril": "Wildfire", "alert_level": "Unknown",
-            "magnitude": None, "wind_kmh": None, "status": "", "atcf_id": "",
-            "pressure_mb": None, "advisory_number": "", "move_direction": "", "move_kmh": None,
-            "formation_chance": None, "disturbance_code": "",
-            "acres": acres if isinstance(acres, (int, float)) else None,
-            "contained_pct": contained if isinstance(contained, (int, float)) else None,
-            "lat": lat, "lon": lon, "tier": tier,
+            "updated_utc": updated,
+            "time": fmt_bermuda(updated) if updated else "—",
+            "age": age_label(updated),
+            "url": url,
+            "metrics": {"acres": acres, "contained_pct": contained},
+            "metric_text": " · ".join(metric_bits),
+            "color": SEVERITY_COLOR.get(severity, SEVERITY_COLOR["Info"]),
         })
-    return rows
+    return events
+
+# ---------------------------------------------------------------------------
+# Normalized map records
+# ---------------------------------------------------------------------------
 
 
-def tracking_key(row):
-    nhc_key = nhc_active_storm_key(row)
-    if nhc_key:
-        return nhc_key
-    if row.get("atcf_id"):
-        return f"ATCF|{row['atcf_id']}"
-    if row.get("disturbance_code"):
-        return f"INVEST|{row['disturbance_code']}"
-    if row.get("source") == "CAL FIRE":
-        return f"CALFIRE|{str(row.get('raw_title', '')).strip().lower()}"
-    name = extract_storm_name(str(row.get("raw_title", "")), str(row.get("summary", "")))
-    if row.get("peril") == "Tropical Cyclone" and name:
-        return f"CYCLONE|{name.lower()}"
-    return f"{row.get('source','')}|{str(row.get('raw_title','')).strip().lower()}"
-
-
-@st.cache_resource(show_spinner=False)
-def supabase_client():
-    """Create the server-side Supabase client from private Streamlit secrets."""
-    if create_client is None:
-        return None
-    try:
-        config = st.secrets["supabase"]
-        url = str(config["url"]).strip()
-        key = str(config["key"]).strip()
-    except (KeyError, TypeError, AttributeError):
-        return None
-    if not url or not key:
-        return None
-    return create_client(url, key)
-
-
-def supabase_health_check():
-    """Verify that CatWatch can read the history schema without writing data."""
-    if create_client is None:
-        return False, "Supabase package is not installed."
-    try:
-        config = st.secrets["supabase"]
-        if not str(config["url"]).strip() or not str(config["key"]).strip():
-            return False, "Supabase secrets are incomplete."
-    except (KeyError, TypeError, AttributeError):
-        return False, "Supabase secrets are not configured."
-    try:
-        client = supabase_client()
-        if client is None:
-            return False, "Supabase client could not be created."
-        client.table("events").select("event_key").limit(1).execute()
-        return True, "Connected to persistent event history."
-    except Exception as exc:
-        # Do not expose credentials or a full backend exception in the UI.
-        message = str(exc).replace("\n", " ").strip()
-        if len(message) > 180:
-            message = message[:177] + "..."
-        return False, f"Connection failed: {message}"
-
-
-HISTORY_FIELDS = [
-    "status", "forecast_status", "wind_kmh", "pressure_mb",
-    "formation_chance", "move_direction", "move_kmh", "lat", "lon",
-    "magnitude", "acres", "contained_pct", "alert_level", "tier",
-    "advisory_number", "raw_title", "summary",
-]
-
-HISTORY_LABELS = {
-    "status": "Status", "forecast_status": "Forecast", "wind_kmh": "Wind",
-    "pressure_mb": "Pressure", "formation_chance": "Formation chance",
-    "move_direction": "Movement direction", "move_kmh": "Movement speed",
-    "lat": "Latitude", "lon": "Longitude", "magnitude": "Magnitude",
-    "acres": "Area", "contained_pct": "Containment", "alert_level": "Alert",
-    "tier": "Tier", "advisory_number": "Advisory", "raw_title": "Source title",
-    "summary": "Source text",
-}
-
-
-def history_value(value):
-    """Convert pandas/numpy values into stable JSON-safe Python values."""
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except Exception:
-            pass
-    if isinstance(value, float):
-        return round(value, 4)
-    return value
-
-
-def iso_utc(value):
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, pd.Timestamp):
-        value = value.to_pydatetime()
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat()
-    parsed = parse_dt(str(value))
-    return parsed.isoformat() if parsed else None
-
-
-def observation_state(row):
-    return {field: history_value(row.get(field)) for field in HISTORY_FIELDS}
-
-
-def observation_hash(state):
-    payload = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def format_history_value(field, value):
-    if value is None or value == "":
-        return "not stated"
-    try:
-        number = float(value)
-        if field == "wind_kmh":
-            return f"{number:.0f} km/h"
-        if field == "pressure_mb":
-            return f"{number:.0f} mb"
-        if field in {"formation_chance", "contained_pct"}:
-            return f"{number:.0f}%"
-        if field == "move_kmh":
-            return f"{number:.0f} km/h"
-        if field == "magnitude":
-            return f"M{number:g}"
-        if field == "acres":
-            return f"{number:,.0f} acres"
-        if field in {"lat", "lon"}:
-            return f"{number:.3f}"
-    except (TypeError, ValueError):
-        pass
-    if field == "forecast_status" and value:
-        return f"Expected to become {value}"
-    return str(value)
-
-
-def initial_state_text(current):
-    """Build a concise baseline summary while full values remain in observations."""
-    parts = []
-    for field in ("status", "magnitude", "wind_kmh", "pressure_mb", "formation_chance", "acres", "contained_pct"):
-        value = current.get(field)
-        if value not in (None, ""):
-            parts.append(format_history_value(field, value))
-    alert = current.get("alert_level")
-    if alert not in (None, "", "Unknown"):
-        parts.append(f"{alert} alert")
-    tier = current.get("tier")
-    if tier not in (None, ""):
-        parts.append(str(tier))
-    return " · ".join(parts[:6])
-
-
-# --- Tropical cyclone materiality -------------------------------------------
-# The timeline for a storm should read the way an underwriter would summarise
-# it verbally: lifecycle stage first, then intensity (Saffir-Simpson), then the
-# forecast track/landfall. Wind, pressure and movement remain as supplemental
-# detail beneath the headline. All values below are derived from fields already
-# stored (wind_kmh, status, forecast_status, summary), so no schema change is
-# required and existing observations stay compatible.
-
-# Saffir-Simpson thresholds expressed in km/h (converted from the 64/83/96/113/
-# 137 kt category boundaries).
-SAFFIR_SIMPSON_KMH = [(252, 5), (209, 4), (178, 3), (154, 2), (119, 1)]
-
-TC_STATUS_RANK = {
-    "Post-Tropical Cyclone": -1,
-    "Invest": 0,
-    "Potential Tropical Cyclone": 1,
-    "Tropical Depression": 2,
-    "Tropical Storm": 3,
-    "Hurricane": 4,
-    "Typhoon": 4,
-    "Major Hurricane": 5,
-}
-
-TC_STATUS_ABBR = {
-    "Invest": "Invest",
-    "Potential Tropical Cyclone": "PTC",
-    "Tropical Depression": "TD",
-    "Tropical Storm": "TS",
-    "Hurricane": "Hurricane",
-    "Typhoon": "Typhoon",
-    "Major Hurricane": "Major Hurricane",
-    "Post-Tropical Cyclone": "Post-Tropical",
-}
-
-
-def saffir_simpson_category(wind_kmh):
-    """Return the Saffir-Simpson category (1-5) for a wind speed, else None."""
-    try:
-        if wind_kmh is None or pd.isna(wind_kmh):
-            return None
-        wind = float(wind_kmh)
-    except (TypeError, ValueError):
-        return None
-    for threshold, category in SAFFIR_SIMPSON_KMH:
-        if wind >= threshold:
-            return category
-    return None
-
-
-def tc_status_with_category(status, category):
-    """Render a status label, appending the category for hurricane-strength systems."""
-    abbr = TC_STATUS_ABBR.get(status, status)
-    if category and status in {"Hurricane", "Major Hurricane", "Typhoon"}:
-        return f"{abbr} (Cat {category})"
-    return abbr
-
-
-def extract_tc_threat(text):
-    """Best-effort forecast landfall/approach location from NHC advisory text."""
-    text = clean_optional_text(text)
-    if not text:
-        return ""
-    patterns = [
-        r"(?:hurricane|tropical storm|storm surge)\s+warning\s+is\s+in\s+effect\s+for\s+"
-        r"([A-Z][A-Za-z .'\-]+?)(?:\.|,|;| from | and | to |$)",
-        r"(?:forecast|expected)\s+to\s+(?:move\s+)?(?:near|over|across|toward|onto|into|inland over)\s+"
-        r"(?:or\s+(?:near|over)\s+)?(?:the\s+)?([A-Z][A-Za-z .'\-]+?)"
-        r"(?:\.|,|;| by | late | early | tonight | on | within | (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)|$)",
-        r"(?:approaching|nearing|move near)\s+(?:the\s+)?([A-Z][A-Za-z .'\-]+?)"
-        r"(?:\.|,|;| by | late | early | tonight | on | within |$)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if m:
-            loc = _clean_location(m.group(1))
-            loc = re.sub(r"^(?:the|a|an)\s+", "", loc, flags=re.IGNORECASE).strip()
-            if 2 <= len(loc) <= 40:
-                return loc
-    return ""
-
-
-def extract_tc_timing(text):
-    """Best-effort forecast timing cue (hours, day, or relative term)."""
-    text = clean_optional_text(text)
-    if not text:
-        return ""
-    m = re.search(r"(?:within|in|over the next)\s+(?:the\s+next\s+)?(\d{1,3})\s*(?:to\s*\d{1,3}\s*)?hours",
-                  text, flags=re.IGNORECASE)
-    if m:
-        return f"~{m.group(1)}h"
-    m = re.search(r"\b(tonight|today|tomorrow|this evening|this morning|overnight)\b",
-                  text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).lower()
-    m = re.search(r"\b(?:by|on|late|early)\s+(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
-                  text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return ""
-
-
-def tc_threat_text(summary):
-    """Combine forecast location and timing into a short track/landfall phrase."""
-    location = extract_tc_threat(summary)
-    if not location:
-        return ""
-    timing = extract_tc_timing(summary)
-    return f"{location} {timing}".strip() if timing else location
-
-
-def tc_change_records(previous, current):
-    """Peril-aware headline changes for a tropical cyclone, ordered by materiality."""
-    records = []
-    previous = previous or {}
-    prev_status = clean_optional_text(previous.get("status"))
-    cur_status = clean_optional_text(current.get("status"))
-    prev_cat = saffir_simpson_category(previous.get("wind_kmh"))
-    cur_cat = saffir_simpson_category(current.get("wind_kmh"))
-
-    # 1. Lifecycle stage transition (upgrade or downgrade), with category.
-    if prev_status and cur_status and prev_status != cur_status:
-        prev_rank = TC_STATUS_RANK.get(prev_status, 0)
-        cur_rank = TC_STATUS_RANK.get(cur_status, 0)
-        direction = "Upgraded" if cur_rank > prev_rank else "Downgraded"
-        records.append((
-            "lifecycle", prev_status, cur_status,
-            f"{direction} {TC_STATUS_ABBR.get(prev_status, prev_status)} \u2192 "
-            f"{tc_status_with_category(cur_status, cur_cat)}",
-        ))
-    # 2. Saffir-Simpson category shift while the status label is unchanged
-    #    (e.g. Cat 1 -> Cat 2, or Major Hurricane Cat 3 -> Cat 4).
-    elif cur_cat and prev_cat and cur_cat != prev_cat:
-        direction = "Intensified" if cur_cat > prev_cat else "Weakened"
-        records.append((
-            "category", f"Cat {prev_cat}", f"Cat {cur_cat}",
-            f"{direction} to Cat {cur_cat} (from Cat {prev_cat})",
-        ))
-
-    # 3. Forecast intensification target, with expected timing when stated.
-    prev_fore = clean_optional_text(previous.get("forecast_status"))
-    cur_fore = clean_optional_text(current.get("forecast_status"))
-    if cur_fore and cur_fore != prev_fore:
-        timing = extract_forecast_timing(current.get("summary"))
-        timing_txt = f" {timing}" if timing else ""
-        records.append((
-            "forecast_status", prev_fore or None, cur_fore,
-            f"Now forecast to reach {cur_fore}{timing_txt}",
-        ))
-
-    # 4. Forecast track / landfall threat.
-    prev_threat = tc_threat_text(previous.get("summary"))
-    cur_threat = tc_threat_text(current.get("summary"))
-    if cur_threat and cur_threat != prev_threat:
-        records.append((
-            "landfall", prev_threat or None, cur_threat,
-            f"Forecast track: {cur_threat}",
-        ))
-    return records
-
-
-def tc_initial_state_text(current):
-    """Underwriter-style baseline line for a newly observed tropical cyclone."""
-    parts = []
-    status = clean_optional_text(current.get("status"))
-    category = saffir_simpson_category(current.get("wind_kmh"))
-    if status:
-        parts.append(tc_status_with_category(status, category))
-    forecast = clean_optional_text(current.get("forecast_status"))
-    if forecast:
-        timing = extract_forecast_timing(current.get("summary"))
-        parts.append(f"forecast {forecast}{(' ' + timing) if timing else ''}")
-    threat = tc_threat_text(current.get("summary"))
-    if threat:
-        parts.append(f"track {threat}")
-    for field in ("wind_kmh", "pressure_mb", "formation_chance"):
-        value = current.get(field)
-        if value not in (None, ""):
-            parts.append(format_history_value(field, value))
-    return " \u00b7 ".join(parts[:6])
-
-
-def build_change_records(previous, current, peril=""):
-    # Outlooks are basin summaries; never treat them as a lifecycle-bearing storm,
-    # and suppress any status/forecast that leaked in from earlier stored records.
-    is_outlook_row = is_outlook(
-        clean_optional_text(current.get("raw_title")),
-        clean_optional_text(current.get("summary")),
-    )
-    is_tc = clean_optional_text(peril) == "Tropical Cyclone" and not is_outlook_row
-    if previous is None:
-        baseline = tc_initial_state_text(current) if is_tc else initial_state_text(current)
-        changes = [("first_observed", None, None, "First observed by CatWatch")]
-        if baseline:
-            changes.append(("initial_state", None, None, f"Initial state: {baseline}"))
-        return changes
-
-    changes = []
-    handled_fields = set()
-    if is_tc:
-        # The richer TC headline records carry the material story: lifecycle
-        # stage, Saffir-Simpson category, forecast target and track. Wind,
-        # pressure, movement and advisory numbers are supplemental and are
-        # deliberately suppressed from the timeline so the progression stays
-        # uncluttered. They remain visible on the card's status panel and in the
-        # raw source observations, so nothing is lost, just de-emphasised.
-        changes.extend(tc_change_records(previous, current))
-        handled_fields = {
-            "status", "forecast_status", "wind_kmh", "pressure_mb",
-            "move_direction", "move_kmh", "advisory_number",
-        }
-    elif is_outlook_row:
-        # Suppress bogus lifecycle diffs (e.g. "Post-Tropical -> Hurricane")
-        # that were mis-extracted from outlook prose in earlier observations.
-        handled_fields = {"status", "forecast_status"}
-    for field in HISTORY_FIELDS:
-        old = previous.get(field)
-        new = current.get(field)
-        if old == new:
-            continue
-        if field in handled_fields:
-            continue
-        # Full source text and exact coordinates remain stored for audit. Source
-        # wording alone is a genuine observation update, but it is not a user
-        # notification unless another tracked event field also changed.
-        if field in {"raw_title", "summary"}:
-            continue
-        # Small coordinate movements create noise and are retained only in the
-        # underlying observation record.
-        if field in {"lat", "lon"}:
-            continue
-        label = HISTORY_LABELS[field]
-        changes.append((
-            field, old, new,
-            f"{label}: {format_history_value(field, old)} → {format_history_value(field, new)}",
-        ))
-    raw_changed = any(previous.get(field) != current.get(field) for field in ("raw_title", "summary"))
-    if raw_changed and not changes:
-        changes.append(("source_text", None, None, "Source text updated"))
-    return changes
-
-def chunked(items, size=100):
-    items = list(items)
-    for index in range(0, len(items), size):
-        yield items[index:index + size]
-
-
-def prior_state_from_observation(prior):
-    if not prior:
-        return None
+def tc_to_map_event(s):
     return {
-        "status": prior.get("status"), "forecast_status": prior.get("forecast_status"),
-        "wind_kmh": prior.get("wind_kmh"), "pressure_mb": prior.get("pressure_mb"),
-        "formation_chance": prior.get("formation_chance"),
-        "move_direction": prior.get("movement_direction"), "move_kmh": prior.get("movement_kmh"),
-        "lat": prior.get("latitude"), "lon": prior.get("longitude"),
-        "magnitude": prior.get("magnitude"), "acres": prior.get("acres"),
-        "contained_pct": prior.get("contained_pct"), "alert_level": prior.get("alert_level"),
-        "tier": prior.get("tier"), "advisory_number": prior.get("advisory_number"),
-        "raw_title": prior.get("raw_title"), "summary": prior.get("raw_summary"),
+        "event_id": s["event_id"],
+        "source": s["source"],
+        "peril": "Tropical Cyclone",
+        "title": s["name"],
+        "summary": s["klass"],
+        "severity": s["severity"],
+        "alert_level": "Unknown",
+        "lat": s.get("lat"),
+        "lon": s.get("lon"),
+        "time": s.get("time"),
+        "url": s.get("url"),
+        "metric_text": f"{s['vmax']:.0f} kt" if s.get("vmax") else "",
+        "color": s.get("color") or tc_color(s.get("vmax"), s.get("invest")),
     }
 
 
-def fetch_latest_observations(client, event_keys):
-    """Load latest saved observations in batches instead of one request per event."""
-    latest = {}
-    fields = (
-        "observation_id,event_key,detected_at,observation_hash,status,forecast_status,"
-        "wind_kmh,pressure_mb,formation_chance,movement_direction,movement_kmh,"
-        "latitude,longitude,magnitude,acres,contained_pct,alert_level,tier,"
-        "advisory_number,raw_title,raw_summary"
-    )
-    for keys in chunked(event_keys, 100):
-        response = (
-            client.table("observations")
-            .select(fields)
-            .in_("event_key", keys)
-            .order("detected_at", desc=True)
-            .limit(5000)
-            .execute()
-        )
-        for item in response.data or []:
-            latest.setdefault(item.get("event_key"), item)
-    return latest
+def build_map_layers(events, tropical_systems, show_tracks=True):
+    obs_paths, fc_paths, cones, dots = [], [], [], []
 
+    if show_tracks:
+        for s in tropical_systems:
+            col = tc_color(s.get("vmax"), s.get("invest"))
+            if len(s.get("track", [])) >= 2:
+                obs_paths.append({"path": s["track"], "color": col})
+            if len(s.get("fc_track", [])) >= 2:
+                fc_paths.append({"path": s["fc_track"], "color": [255, 255, 255]})
+            if s.get("cone"):
+                cones.append({"polygon": s["cone"]})
 
-def persist_event_history(df, client=None):
-    """Batch history reads/upserts; write observations only for genuine new states."""
-    client = client or supabase_client()
-    if client is None or df.empty:
-        out = df.copy()
-        out["history_changes"] = [[] for _ in range(len(out))]
-        return out, "Persistent history unavailable."
-
-    out = df.copy()
-    detected_at = datetime.now(timezone.utc).isoformat()
-    prepared = []
-    event_payloads = []
-    for _, row in out.iterrows():
-        event_key = str(row.get("event_id") or tracking_key(row))
-        state = observation_state(row)
-        prepared.append((row, event_key, state, observation_hash(state)))
-        event_payloads.append({
-            "event_key": event_key,
-            "peril": clean_optional_text(row.get("peril")) or "Other",
-            "source": clean_optional_text(row.get("source")) or "Unknown",
-            "display_name": clean_optional_text(row.get("title")) or event_key,
-            "last_seen_at": detected_at,
-            "active": True,
-            "latest_source_url": clean_optional_text(row.get("link")) or None,
-            "updated_at": detected_at,
+    for e in events:
+        lat, lon = to_float(e.get("lat")), to_float(e.get("lon"))
+        if lat is None or lon is None:
+            continue
+        sev = e.get("severity", "Info")
+        radius = {"Critical": 85000, "Watch": 70000, "Advisory": 56000, "Info": 44000}.get(sev, 44000)
+        dots.append({
+            "position": [lon, lat],
+            "color": e.get("color") or PERIL_META.get(e.get("peril"), PERIL_META["Other"])["color"],
+            "radius": radius,
+            "title": e.get("title", "Untitled event"),
+            "peril": e.get("peril", "Other"),
+            "source": e.get("source", ""),
+            "severity": sev,
+            "metric": e.get("metric_text", ""),
+            "time": e.get("time", "—"),
         })
 
-    failures = []
-    try:
-        for payload_batch in chunked(event_payloads, 100):
-            client.table("events").upsert(payload_batch, on_conflict="event_key").execute()
-        latest_by_key = fetch_latest_observations(client, [item[1] for item in prepared])
-    except Exception as exc:
-        out["history_changes"] = [[] for _ in range(len(out))]
-        return out, f"History batch read failed: {str(exc)[:180]}"
-
-    row_changes = []
-    for row, event_key, state, state_hash in prepared:
-        prior = latest_by_key.get(event_key)
-        if prior and prior.get("observation_hash") == state_hash:
-            row_changes.append([])
-            continue
-        source_updated_at = iso_utc(row.get("published_utc"))
-        observation_payload = {
-            "event_key": event_key, "detected_at": detected_at,
-            "source_updated_at": source_updated_at,
-            "status": state.get("status"), "forecast_status": state.get("forecast_status"),
-            "wind_kmh": state.get("wind_kmh"), "pressure_mb": state.get("pressure_mb"),
-            "formation_chance": state.get("formation_chance"),
-            "movement_direction": state.get("move_direction"), "movement_kmh": state.get("move_kmh"),
-            "latitude": state.get("lat"), "longitude": state.get("lon"),
-            "magnitude": state.get("magnitude"), "acres": state.get("acres"),
-            "contained_pct": state.get("contained_pct"), "alert_level": state.get("alert_level"),
-            "tier": state.get("tier"), "advisory_number": state.get("advisory_number"),
-            "raw_title": state.get("raw_title"), "raw_summary": state.get("summary"),
-            "source_url": clean_optional_text(row.get("link")) or None,
-            "observation_hash": state_hash,
-        }
-        try:
-            try:
-                inserted = client.table("observations").insert(observation_payload).execute()
-            except Exception:
-                existing = (
-                    client.table("observations").select("observation_id")
-                    .eq("event_key", event_key).eq("observation_hash", state_hash)
-                    .limit(1).execute()
-                )
-                if existing.data:
-                    row_changes.append([])
-                    continue
-                raise
-            if not inserted.data:
-                raise RuntimeError("Observation insert returned no record")
-            observation_id = inserted.data[0]["observation_id"]
-            changes = build_change_records(
-                prior_state_from_observation(prior),
-                state,
-                peril=clean_optional_text(row.get("peril")),
-            )
-            payloads = [{
-                "event_key": event_key, "observation_id": observation_id,
-                "detected_at": detected_at, "source_updated_at": source_updated_at,
-                "field_name": field,
-                "previous_value": None if old is None else str(old),
-                "current_value": None if new is None else str(new),
-                "change_text": text,
-            } for field, old, new, text in changes]
-            if payloads:
-                client.table("changes").insert(payloads).execute()
-            row_changes.append([item[3] for item in changes if item[0] != "source_text"])
-        except Exception as exc:
-            failures.append(f"{event_key}: {str(exc)[:120]}")
-            row_changes.append([])
-
-    out["history_changes"] = row_changes
-    if failures:
-        return out, f"{len(failures)} history write error(s). {' | '.join(failures[:3])}"
-    changed_count = sum(bool(items) for items in row_changes)
-    return out, f"History current. {changed_count} genuine event update(s) recorded."
-
-def get_event_timeline(event_key, limit=25):
-    client = supabase_client()
-    if client is None:
-        return []
-    try:
-        response = (
-            client.table("changes")
-            .select("change_id,observation_id,detected_at,source_updated_at,change_text,field_name")
-            .eq("event_key", event_key)
-            .order("source_updated_at", desc=True)
-            .order("detected_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return response.data or []
-    except Exception:
-        return []
-
-
-NON_CHANGE_FIELDS = {"first_observed", "initial_state", "source_text"}
-
-
-def genuine_timeline_changes(changes):
-    """Exclude the entire baseline observation, including legacy baseline fields."""
-    baseline_observation_ids = {
-        item.get("observation_id")
-        for item in changes
-        if item.get("field_name") in {"first_observed", "initial_state"}
-        and item.get("observation_id") is not None
-    }
-    return [
-        item for item in changes
-        if item.get("field_name") not in NON_CHANGE_FIELDS
-        and item.get("observation_id") not in baseline_observation_ids
+    layers = [
+        pdk.Layer(
+            "PolygonLayer",
+            cones,
+            get_polygon="polygon",
+            get_fill_color=[255, 255, 255, 30],
+            get_line_color=[255, 255, 255, 110],
+            stroked=True,
+            filled=True,
+            line_width_min_pixels=1,
+        ),
+        pdk.Layer("PathLayer", obs_paths, get_path="path", get_color="color", width_min_pixels=7, opacity=0.25),
+        pdk.Layer("PathLayer", obs_paths, get_path="path", get_color="color", width_min_pixels=2.5),
+        pdk.Layer("PathLayer", fc_paths, get_path="path", get_color="color", width_min_pixels=1.5, opacity=0.9),
+        pdk.Layer(
+            "ScatterplotLayer",
+            dots,
+            get_position="position",
+            get_fill_color="color",
+            get_radius="radius",
+            radius_min_pixels=5,
+            radius_max_pixels=22,
+            stroked=True,
+            get_line_color=[10, 12, 20],
+            line_width_min_pixels=2,
+            pickable=True,
+        ),
     ]
+    return layers
 
 
-def timeline_update_count(changes):
-    genuine = genuine_timeline_changes(changes)
-    return len({item.get("observation_id") for item in genuine if item.get("observation_id") is not None})
-
-
-def get_timelines_for_events(event_keys, client=None, per_event_limit=100):
-    """Load all visible card timelines in a few requests and group them locally."""
-    client = client or supabase_client()
-    timelines = {str(key): [] for key in event_keys}
-    if client is None or not timelines:
-        return timelines
-    fields = "change_id,event_key,observation_id,detected_at,source_updated_at,change_text,field_name"
-    try:
-        for keys in chunked(timelines.keys(), 100):
-            response = (
-                client.table("changes").select(fields)
-                .in_("event_key", keys)
-                .order("source_updated_at", desc=True)
-                .order("detected_at", desc=True)
-                .limit(10000).execute()
-            )
-            for item in response.data or []:
-                key = str(item.get("event_key"))
-                if key in timelines and len(timelines[key]) < per_event_limit:
-                    timelines[key].append(item)
-    except Exception:
-        return timelines
-    return timelines
-
-
-def get_observations_for_events(event_keys, client=None, per_event_limit=200):
-    """Batch-load raw observations for visible events so each card's timeline can
-    be recomputed from stored source state instead of the frozen changes table.
-    Recomputing means the latest materiality rules apply to all history."""
-    client = client or supabase_client()
-    result = {str(key): [] for key in event_keys}
-    if client is None or not result:
-        return result
-    fields = (
-        "event_key,detected_at,source_updated_at,status,forecast_status,"
-        "wind_kmh,pressure_mb,formation_chance,movement_direction,movement_kmh,"
-        "latitude,longitude,magnitude,acres,contained_pct,alert_level,tier,"
-        "advisory_number,raw_title,raw_summary"
+def render_world_map(events, tropical_systems=None, height=560, show_tracks=True, key="map"):
+    tropical_systems = tropical_systems or []
+    layers = build_map_layers(events, tropical_systems, show_tracks=show_tracks)
+    st.pydeck_chart(
+        pdk.Deck(
+            map_provider="carto",
+            map_style="dark",
+            initial_view_state=pdk.ViewState(latitude=12, longitude=5, zoom=1.15),
+            layers=layers,
+            tooltip={
+                "html": "<b>{title}</b><br/>{peril} · {source}<br/>{severity} {metric}<br/>{time}",
+                "style": {
+                    "backgroundColor": "#12151c",
+                    "color": "#e6e9ef",
+                    "fontSize": "12px",
+                    "padding": "8px 10px",
+                    "borderRadius": "6px",
+                    "border": "1px solid #2a2f3a",
+                },
+            },
+        ),
+        height=height,
+        use_container_width=True,
     )
-    try:
-        for keys in chunked(result.keys(), 100):
-            response = (
-                client.table("observations").select(fields)
-                .in_("event_key", keys)
-                .order("source_updated_at", desc=True)
-                .order("detected_at", desc=True)
-                .limit(20000).execute()
-            )
-            for item in response.data or []:
-                key = str(item.get("event_key"))
-                if key in result and len(result[key]) < per_event_limit:
-                    result[key].append(item)
-    except Exception:
-        return result
-    return result
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
 
 
-def get_history_events():
-    client = supabase_client()
-    if client is None:
-        return []
-    try:
-        response = (
-            client.table("events")
-            .select("event_key,display_name,peril,source,first_seen_at,last_seen_at,active")
-            .order("last_seen_at", desc=True)
-            .limit(500)
-            .execute()
-        )
-        return response.data or []
-    except Exception:
-        return []
-
-
-def get_event_observations(event_key, limit=100):
-    client = supabase_client()
-    if client is None:
-        return []
-    try:
-        response = (
-            client.table("observations")
-            .select("*")
-            .eq("event_key", event_key)
-            .order("source_updated_at", desc=True)
-            .order("detected_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return response.data or []
-    except Exception:
-        return []
-
-
-def timeline_timestamp(item):
-    value = item.get("source_updated_at") or item.get("detected_at")
-    return format_local_time(value)
-
-
-def compute_observation_timeline(observations, peril=""):
-    """Rebuild the change timeline from stored observations using the current
-    materiality rules, so historical entries reflect the latest logic (e.g. TC
-    lifecycle headlines and noise suppression) rather than whatever text was
-    frozen when the change was first written. Returns newest-first entries."""
-    if not observations:
-        return []
-    # ISO timestamps sort chronologically as plain strings.
-    ordered = sorted(
-        observations,
-        key=lambda o: (o.get("source_updated_at") or o.get("detected_at") or ""),
-    )
-    # Best-known forecast timing ("by Wednesday"): the forecast-to-become-hurricane
-    # window is a persistent, current fact. Older observations that recorded the
-    # forecast transition may have stored only the thin RSS summary (before full
-    # bulletin text was fetched), so their timing is blank. Take the timing from
-    # the most recent observation that has one and attach it to the forecast
-    # entry, so the change log reflects the current forecast window rather than a
-    # stale blank.
-    latest_timing = ""
-    for obs in reversed(ordered):
-        candidate = clean_optional_text(obs.get("forecast_timing")) or extract_forecast_timing(
-            obs.get("raw_summary") or obs.get("summary")
-        )
-        if candidate:
-            latest_timing = candidate
-            break
-    entries = []
-    prev_state = None
-    for obs in ordered:
-        state = prior_state_from_observation(obs)
-        records = build_change_records(prev_state, state, peril=peril)
-        texts = []
-        for field, _old, _new, text in records:
-            if field in {"first_observed", "initial_state", "source_text"}:
-                continue
-            # If a forecast entry lacks the timing (thin stored text) but the
-            # current forecast window is known, append it.
-            if (field == "forecast_status" and latest_timing
-                    and " by " not in text and "within " not in text):
-                text = f"{text} {latest_timing}"
-            texts.append(text)
-        if texts:
-            entries.append({
-                "source_time": obs.get("source_updated_at") or obs.get("detected_at"),
-                "detected_time": obs.get("detected_at"),
-                "changes": texts,
-            })
-        prev_state = state
-    entries.reverse()
-    return entries
-
-
-def render_event_timeline(event_key, peril="", observations=None, compact=True):
-    if observations is None:
-        observations = get_event_observations(event_key, limit=200)
-    entries = compute_observation_timeline(observations, peril=peril)
-    if not entries:
-        st.caption("No material changes recorded since first observed.")
-        return
-    for entry in entries:
-        st.markdown(f"**{timeline_timestamp({'source_updated_at': entry['source_time']})}**")
-        for text in entry["changes"]:
-            st.markdown(f"- {text}")
-        detected = parse_dt(entry["detected_time"])
-        source_time = parse_dt(entry["source_time"])
-        if detected and source_time and abs((detected - source_time).total_seconds()) >= 60:
-            st.caption(f"Detected by CatWatch: {format_local_time(detected)}")
-
-def render_history_tab():
-    st.subheader("Event History")
-    st.caption("Persistent timelines containing actual source changes, not dashboard refreshes.")
-    events = get_history_events()
-    if not events:
-        st.info("No persistent event history has been recorded yet.")
-        return
-    events_df = pd.DataFrame(events)
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        peril_options = ["All"] + sorted(events_df["peril"].dropna().unique().tolist())
-        peril_filter = st.selectbox("Peril", peril_options, key="history_peril")
-    with c2:
-        source_options = ["All"] + sorted(events_df["source"].dropna().unique().tolist())
-        source_filter = st.selectbox("Source", source_options, key="history_source")
-    with c3:
-        search = st.text_input("Find event", placeholder="Storm, fire, earthquake...", key="history_search")
-    view = events_df.copy()
-    if peril_filter != "All":
-        view = view[view["peril"] == peril_filter]
-    if source_filter != "All":
-        view = view[view["source"] == source_filter]
-    if search:
-        view = view[view["display_name"].str.contains(search, case=False, na=False)]
-    if view.empty:
-        st.info("No events match the selected history filters.")
-        return
-    labels = {
-        row["event_key"]: f"{row['display_name']} · {row['source']}"
-        for _, row in view.iterrows()
-    }
-    event_key = st.selectbox("Event", list(labels), format_func=lambda key: labels[key], key="history_event")
-    selected = view[view["event_key"] == event_key].iloc[0]
-    st.markdown(f"### {selected['display_name']}")
-    st.caption(f"{selected['peril']} · {selected['source']} · Event key: {event_key}")
-    observations = get_event_observations(event_key, limit=200)
-    if observations:
-        latest = observations[0]
-        metrics = []
-        for label, field in [("Status", "status"), ("Forecast", "forecast_status"), ("Wind", "wind_kmh"), ("Pressure", "pressure_mb"), ("Area", "acres"), ("Containment", "contained_pct")]:
-            value = latest.get(field)
-            if value not in (None, ""):
-                metrics.append((label, format_history_value(field, value)))
-        if metrics:
-            columns = st.columns(min(len(metrics), 4))
-            for index, (label, value) in enumerate(metrics):
-                columns[index % len(columns)].metric(label, value)
-    st.markdown("#### Timeline")
-    render_event_timeline(event_key, peril=selected.get("peril", ""), observations=observations, compact=False)
-    if observations:
-        with st.expander("Original source updates"):
-            for observation in observations:
-                stamp = observation.get("source_updated_at") or observation.get("detected_at")
-                st.markdown(f"**{timeline_timestamp({'source_updated_at': stamp})}**")
-                st.write(observation.get("raw_title") or "Untitled source update")
-                if observation.get("raw_summary"):
-                    st.caption(observation["raw_summary"])
-                if observation.get("source_url"):
-                    st.markdown(f"[Open source]({observation['source_url']})")
-                st.divider()
-
-
-def history_connection():
-    conn = sqlite3.connect(HISTORY_DB)
-    conn.execute("""CREATE TABLE IF NOT EXISTS observations (
-        tracking_key TEXT NOT NULL, observed_at TEXT NOT NULL, published TEXT,
-        title TEXT, peril TEXT, tier TEXT, status TEXT, wind_kmh REAL,
-        pressure_mb REAL, formation_chance REAL, acres REAL, contained_pct REAL,
-        advisory_number TEXT, move_direction TEXT, move_kmh REAL,
-        PRIMARY KEY (tracking_key, observed_at)
-    )""")
-    return conn
-
-
-def material_changes(df, refresh_token):
-    """Compare current observations with SQLite history and classify meaningful updates."""
-    out = df.copy()
-    conn = history_connection()
-    changes_col, material_col, update_col = [], [], []
-    now = datetime.now(timezone.utc).isoformat()
-    numeric = ["wind_kmh", "pressure_mb", "formation_chance", "acres", "contained_pct", "move_kmh"]
-    status_rank = {"Invest": 0, "Potential Tropical Cyclone": 1, "Tropical Depression": 2,
-                   "Tropical Storm": 3, "Hurricane": 4, "Typhoon": 4, "Major Hurricane": 5,
-                   "Post-Tropical Cyclone": -1}
-
-    for _, row in out.iterrows():
-        key = tracking_key(row)
-        prior_row = conn.execute("SELECT status, wind_kmh, pressure_mb, formation_chance, acres, contained_pct, advisory_number, move_direction, move_kmh FROM observations WHERE tracking_key=? ORDER BY observed_at DESC LIMIT 1", (key,)).fetchone()
-        prior = dict(zip(["status", "wind_kmh", "pressure_mb", "formation_chance", "acres", "contained_pct", "advisory_number", "move_direction", "move_kmh"], prior_row)) if prior_row else {}
-        changes, important, kind = [], False, "Routine update"
-        status = row.get("status") or ""
-
-        if not prior and row.get("peril") == "Tropical Cyclone" and status in ("Tropical Depression", "Tropical Storm", "Hurricane", "Typhoon", "Major Hurricane", "Potential Tropical Cyclone"):
-            changes.append(f"New {status}")
-            important, kind = True, "New cyclone"
-        elif prior.get("status") and status and prior["status"] != status:
-            changes.append(f"Status: {prior['status']} -> {status}")
-            if status_rank.get(status, 0) > status_rank.get(prior["status"], 0):
-                important, kind = True, "Cyclone upgrade"
-
-        def delta(field):
-            current, previous = row.get(field), prior.get(field)
-            if current is None or pd.isna(current) or previous is None:
-                return None
-            return float(current) - float(previous)
-
-        d = delta("wind_kmh")
-        if d is not None and abs(d) >= 1:
-            changes.append(f"Wind {d:+.0f} km/h")
-            if d >= 15:
-                important, kind = True, "Rapid strengthening"
-        d = delta("pressure_mb")
-        if d is not None and abs(d) >= 1:
-            changes.append(f"Pressure {d:+.0f} mb")
-            if d <= -5:
-                important, kind = True, "Pressure falling"
-        d = delta("formation_chance")
-        if d is not None and abs(d) >= 1:
-            changes.append(f"Formation chance {d:+.0f} pts")
-            cur = float(row.get("formation_chance"))
-            prev = float(prior.get("formation_chance"))
-            if d >= 20 or any(prev < x <= cur for x in (40, 70, 90)):
-                important, kind = True, "Formation chance increased"
-        d = delta("acres")
-        if d is not None and abs(d) >= 1:
-            changes.append(f"Area {d:+,.0f} acres")
-            if d >= 500:
-                important, kind = True, "Wildfire expanded"
-        d = delta("contained_pct")
-        if d is not None and abs(d) >= 1:
-            changes.append(f"Containment {d:+.0f} pts")
-            if d <= -5:
-                important, kind = True, "Containment deteriorated"
-        if prior.get("advisory_number") and row.get("advisory_number") and prior["advisory_number"] != row.get("advisory_number"):
-            changes.append(f"Advisory {prior['advisory_number']} -> {row.get('advisory_number')}")
-
-        changes_col.append(changes)
-        material_col.append(important)
-        update_col.append(kind if important else ("Updated" if changes else "No material change"))
-        values = [key, now, row.get("published"), row.get("title"), row.get("peril"), row.get("tier"), status]
-        for field in ["wind_kmh", "pressure_mb", "formation_chance", "acres", "contained_pct"]:
-            value = row.get(field)
-            values.append(None if value is None or pd.isna(value) else float(value))
-        values += [row.get("advisory_number") or "", row.get("move_direction") or ""]
-        mv = row.get("move_kmh")
-        values.append(None if mv is None or pd.isna(mv) else float(mv))
-
-        # Insert by explicit column name so the app remains compatible with both
-        # the original 15-column database and the newer 16-column database that
-        # includes source_stamp.
-        observation_columns = [
-            "tracking_key", "observed_at", "published", "title", "peril", "tier",
-            "status", "wind_kmh", "pressure_mb", "formation_chance", "acres",
-            "contained_pct", "advisory_number", "move_direction", "move_kmh",
+def render_legends(include_tc=True, include_perils=True):
+    bits = []
+    if include_tc:
+        bits += [
+            f'<span class="cw-chip" style="background:rgba({r},{g},{b},0.22);color:rgb({r},{g},{b})">{label}</span>'
+            for label, (r, g, b) in TC_PALETTE.items()
         ]
-        database_columns = {
-            column[1] for column in conn.execute("PRAGMA table_info(observations)").fetchall()
-        }
-        if "source_stamp" in database_columns:
-            source_stamp = "|".join([
-                str(row.get("published") or ""),
-                str(row.get("advisory_number") or ""),
-                str(status),
-                str(row.get("wind_kmh") or ""),
-                str(row.get("pressure_mb") or ""),
-                str(row.get("formation_chance") or ""),
-                str(row.get("acres") or ""),
-                str(row.get("contained_pct") or ""),
-            ])
-            observation_columns.insert(1, "source_stamp")
-            values.insert(1, source_stamp)
-
-        placeholders = ", ".join("?" for _ in observation_columns)
-        column_names = ", ".join(observation_columns)
-        conn.execute(
-            f"INSERT OR REPLACE INTO observations ({column_names}) VALUES ({placeholders})",
-            values,
-        )
-
-    conn.commit()
-    conn.close()
-    out["changes"], out["is_material_update"], out["update_type"] = changes_col, material_col, update_col
-    return out
+    if include_perils:
+        bits += [
+            f'<span class="cw-chip" style="background:rgba({meta["color"][0]},{meta["color"][1]},{meta["color"][2]},0.20);color:rgb({meta["color"][0]},{meta["color"][1]},{meta["color"][2]})">{meta["icon"]} {peril}</span>'
+            for peril, meta in PERIL_META.items()
+            if peril != "Tropical Cyclone"
+        ]
+    st.markdown(" ".join(bits), unsafe_allow_html=True)
 
 
-def render_headline(filtered, new_visible):
-    if filtered.empty:
+def render_event_card(event):
+    sev = event.get("severity", "Info")
+    chip_class = {"Critical": "cw-red", "Watch": "cw-orange", "Advisory": "cw-yellow", "Info": "cw-grey"}.get(sev, "cw-grey")
+    metric = event.get("metric_text") or event.get("alert_level") or ""
+    url = event.get("url") or ""
+    summary = display_summary(event.get("summary", ""), max_len=360)
+    link_html = f'<a href="{url}" target="_blank">Open source ↗</a>' if url else ""
+    st.markdown(
+        f"""
+        <div class="cw-card">
+            <span class="cw-chip {chip_class}">{sev}</span>
+            <span class="cw-chip">{peril_icon(event.get('peril'))} {event.get('peril')}</span>
+            <span class="cw-chip">{event.get('source')}</span>
+            <h4 style="margin:10px 0 5px 0">{event.get('title')}</h4>
+            <div class="cw-muted">{metric} · {event.get('time', '—')} · {event.get('age', '')}</div>
+            <div style="margin-top:8px">{summary}</div>
+            <div style="margin-top:8px">{link_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_tc_card(s, ai_on=False):
+    r, g, b = tc_color(s["vmax"], s["invest"])
+    fo = s.get("outlook")
+    brief = None
+    if ai_on and not s.get("invest"):
+        brief = ai_brief(storm_facts(s), s.get("discussion"))
+    if not brief:
+        brief = fallback_brief(s)
+
+    fc_badge = ""
+    if fo and fo["peak_klass"] != s["klass"] and fo["by"]:
+        fc_badge = f'<span class="cw-chip cw-orange">⏱ {fo["peak_klass"]} by {fo["by"]}</span>'
+    trend_chip = f'<span class="cw-chip">{fo["trend"]}</span>' if fo else ""
+    src_link = f'<a href="{s["url"]}" target="_blank">NHC source ↗</a>' if s.get("url") else ""
+
+    st.markdown(
+        f"""
+        <div class="cw-card">
+            <span class="cw-chip" style="background:rgba({r},{g},{b},0.22);color:rgb({r},{g},{b})">{s['klass']}</span>
+            <span class="cw-chip">{s['source']}</span>
+            {fc_badge}{trend_chip}
+            <h4 style="margin:10px 0 5px 0">{s['name']}</h4>
+            <div class="cw-brief">{brief}</div>
+            <div class="cw-muted" style="margin-top:8px">
+                Winds <b>{s['vmax']:.0f} kt</b> · Pressure <b>{f'{s['mslp']:.0f} mb' if s.get('mslp') else 'N/A'}</b> · Moving <b>{s['move']}</b><br/>
+                {s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}
+            </div>
+            <div style="margin-top:8px">{src_link}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_headline(events, tropical_systems):
+    combined = [tc_to_map_event(s) for s in tropical_systems if not s.get("invest")] + list(events)
+    urgent = [e for e in combined if e.get("severity") in ("Critical", "Watch")]
+    urgent.sort(key=lambda e: (severity_rank(e.get("severity")), e.get("peril", ""), e.get("title", "")))
+
+    st.subheader("Morning headline")
+    if not urgent:
+        st.success("No Critical or Watch-level events in the current feed set.")
         return
 
-    critical = int((filtered["tier"] == "Critical").sum())
-    watch = int((filtered["tier"] == "Watch").sum())
-
-    newest = filtered.sort_values(
-        "published_sort",
-        ascending=False,
-        na_position="last"
-    ).head(1)
-
-    newest_text = "No events"
-    if not newest.empty:
-        newest_text = (
-            f"{newest.iloc[0]['title']} "
-            f"• {newest.iloc[0]['age']}"
-        )
-
-    latest_change = "No material changes detected"
-
-    changed = filtered[
-        filtered["changes"].apply(
-            lambda x: isinstance(x, list) and len(x) > 0
-        )
-    ]
-
-    if not changed.empty:
-        changed = changed.sort_values(
-            "published_sort",
-            ascending=False,
-            na_position="last"
-        )
-
-        r = changed.iloc[0]
-
-        latest_change = (
-            f"{r['title']} • "
-            + " | ".join(r["changes"])
-        )
-
-    highest_risk = "No Critical events"
-
-    risk_df = filtered[
-        filtered["tier"].isin(["Critical", "Watch"])
-    ]
-
-    if not risk_df.empty:
-        r = risk_df.iloc[0]
-
-        risk_bits = []
-
-        if pd.notna(r.get("wind_kmh")):
-            risk_bits.append(f"{r['wind_kmh']:.0f} km/h")
-
-        if pd.notna(r.get("acres")):
-            risk_bits.append(f"{r['acres']:,.0f} acres")
-
-        highest_risk = (
-            r["title"]
-            + (" • " + " • ".join(risk_bits) if risk_bits else "")
-        )
-
-    with st.container(border=True):
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.markdown(
-                f"""
-### 🔴 Critical: {critical}
-
-### 🟠 Watch: {watch}
-
-### 🆕 New: {new_visible}
-"""
-            )
-
-        with c2:
-            st.markdown("#### 🚨 HIGHEST RISK")
-            st.write(highest_risk)
-
-        with c3:
-            st.markdown("#### 🆕 NEWEST EVENT")
-            st.write(newest_text)
-
-        st.divider()
-
+    for e in urgent[:8]:
+        metric = f" · {e.get('metric_text')}" if e.get("metric_text") else ""
         st.markdown(
-            f"#### 📈 LATEST CHANGE\n{latest_change}"
+            f"**{peril_icon(e.get('peril'))} {e.get('severity')} · {e.get('peril')} · {e.get('title')}**{metric}  "
+            f"<span class='cw-muted'>{e.get('source', '')} · {e.get('time', '—')}</span>",
+            unsafe_allow_html=True,
         )
 
-def render_material_updates(df):
-    updates = df[df["is_material_update"]].copy() if "is_material_update" in df else df.iloc[0:0]
-    st.subheader("Latest Material Updates")
-    if updates.empty:
-        st.caption("No material changes detected on this refresh.")
-        return
-    updates = updates.sort_values("published_sort", ascending=False, na_position="last")
-    for _, row in updates.head(8).iterrows():
-        icon = peril_icon(row.get("peril", "Other"))
-        change_text = " | ".join(row.get("changes") or [])
-        st.markdown(f"**{icon} {row.get('update_type')}: {row.get('title')}**  ")
-        st.caption(f"{change_text} | {row.get('source')} | {row.get('age')}")
+
+def render_overview(tropical_systems, gdacs_events, calfire_events, jtwc_loading):
+    other_events = gdacs_events + calfire_events
+    map_events = [tc_to_map_event(s) for s in tropical_systems] + other_events
+
+    active_storms = len([s for s in tropical_systems if not s.get("invest")])
+    invests = len([s for s in tropical_systems if s.get("invest")])
+    critical = len([e for e in map_events if e.get("severity") == "Critical"])
+    watch = len([e for e in map_events if e.get("severity") == "Watch"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tropical systems", active_storms)
+    c2.metric("Areas of interest", invests)
+    c3.metric("Critical events", critical)
+    c4.metric("Watch events", watch)
+
+    if jtwc_loading:
+        st.caption("⏳ Loading global JTWC tropical systems in the background...")
+
+    render_legends(include_tc=True, include_perils=True)
+    render_world_map(map_events, tropical_systems=tropical_systems, height=570, show_tracks=True, key="overview_map")
+    render_headline(other_events, tropical_systems)
 
 
-def stable_event_id(row):
-    nhc_key = nhc_active_storm_key(row)
-    if nhc_key:
-        return nhc_key
-    if row.get("disturbance_code"):
-        return f"INVEST|{row.get('disturbance_code')}"
-    if row.get("source") == "CAL FIRE":
-        return f"CALFIRE|{str(row.get('raw_title', '')).strip().lower()}"
-    return "|".join([str(row.get("source", "")), str(row.get("raw_title", "")).strip(), str(row.get("link", "")).strip()])
-
-
-def collapse_nhc_storm_products(df):
-    """Collapse multiple NHC products for the same active storm into one storm card."""
-    if df.empty:
-        return df
-    work = df.copy()
-    work["published_sort"] = pd.to_datetime(work.get("published_utc"), errors="coerce", utc=True)
-    work["_nhc_storm_key"] = work.apply(nhc_active_storm_key, axis=1)
-    mask = work["_nhc_storm_key"].astype(str).ne("")
-    if not mask.any():
-        return work.drop(columns=["_nhc_storm_key"], errors="ignore")
-    priority = {"Advisory": 90, "Public Advisory": 85, "Forecast/Advisory": 80, "Wind Probabilities": 55, "Discussion": 35, "NHC Product": 25}
-    collapsed = []
-    used = set()
-    for key, group in work[mask].groupby("_nhc_storm_key", sort=False):
-        g = group.copy()
-        g["_product_priority"] = g.get("product_type").map(priority).fillna(10)
-        g["_metric_score"] = 0
-        for col in ["wind_kmh", "pressure_mb", "advisory_number", "move_kmh", "lat", "lon"]:
-            if col in g.columns:
-                g["_metric_score"] += g[col].notna().astype(int)
-        g = g.sort_values(["_metric_score", "_product_priority", "published_sort"], ascending=[False, False, False], na_position="last")
-        best = g.iloc[0].copy()
-        latest = g["published_sort"].max()
-        if pd.notna(latest):
-            latest_py = latest.to_pydatetime() if hasattr(latest, "to_pydatetime") else latest
-            best["published_utc"] = latest_py
-            best["published"] = latest_py.strftime("%Y-%m-%d %H:%M UTC")
-            best["age"] = age_label(latest_py)
-            best["published_sort"] = pd.Timestamp(latest_py)
-        status_rank = {
-            "Potential Tropical Cyclone": 0, "Tropical Depression": 1,
-            "Tropical Storm": 2, "Hurricane": 3, "Major Hurricane": 4,
-            "Post-Tropical Cyclone": 5,
-        }
-        current_statuses = [
-            clean_optional_text(value)
-            for value in g.get("status", pd.Series(dtype=str)).tolist()
-            if clean_optional_text(value)
-        ]
-        if current_statuses:
-            best["status"] = max(current_statuses, key=lambda value: status_rank.get(value, -1))
-        forecast_statuses = [
-            clean_optional_text(value)
-            for value in g.get("forecast_status", pd.Series(dtype=str)).tolist()
-            if clean_optional_text(value)
-        ]
-        chosen_forecast = (
-            max(forecast_statuses, key=lambda value: status_rank.get(value, -1))
-            if forecast_statuses else ""
-        )
-        best["forecast_status"] = chosen_forecast
-        # The forecast timing ("by Wednesday") is extracted per product but must
-        # survive the collapse: pair it with the product that carried the chosen
-        # forecast status, falling back to any non-empty timing in the group.
-        timing_value = ""
-        if "forecast_status" in g.columns and "forecast_timing" in g.columns:
-            for fs, ft in zip(g["forecast_status"].tolist(), g["forecast_timing"].tolist()):
-                if clean_optional_text(fs) == chosen_forecast and clean_optional_text(ft):
-                    timing_value = clean_optional_text(ft)
-                    break
-        if not timing_value and "forecast_timing" in g.columns:
-            for ft in g["forecast_timing"].tolist():
-                if clean_optional_text(ft):
-                    timing_value = clean_optional_text(ft)
-                    break
-        best["forecast_timing"] = timing_value
-        products = [p for p in g.get("product_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if p]
-        best["source_product_count"] = int(len(g))
-        best["source_products"] = ", ".join(products)
-        best["event_id"] = str(key)
-        best["dedup_key"] = str(key)
-        wind_val = best.get("wind_kmh") if pd.notna(best.get("wind_kmh")) else None
-        storm_name = extract_nhc_storm_name(best.get("raw_title", ""), best.get("summary", ""))
-        title_source = f"{best.get('status', '')} {storm_name}".strip() if storm_name else best.get("raw_title", "")
-        best["title"] = build_tc_title(title_source, "", status=best.get("status", ""), wind=wind_val)
-        best["tier"] = infer_tier(best)
-        collapsed.append(best.drop(labels=[c for c in ["_metric_score", "_product_priority"] if c in best.index]))
-        used.update(g.index.tolist())
-    untouched = work.drop(index=list(used))
-    out = pd.concat([untouched, pd.DataFrame(collapsed)], ignore_index=True, sort=False)
-    return out.drop(columns=["_nhc_storm_key"], errors="ignore")
-
-@st.cache_data(ttl=300, show_spinner=True)
-def load_events():
-    all_rows = []
-    max_workers = min(10, len(FEEDS) + 1)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(fetch_feed, feed): feed for feed in FEEDS}
-        calfire_future = executor.submit(fetch_calfire)
-        for future in as_completed(future_map):
-            feed = future_map[future]
-            try:
-                all_rows.extend(future.result())
-            except Exception as exc:
-                all_rows.append({
-                    "source": feed["source"], "feed": feed["name"], "url": feed["url"],
-                    "raw_title": "Feed error", "title": f"{feed['name']} unavailable",
-                    "summary": str(exc), "link": feed["url"], "published_utc": None,
-                    "published": "Unknown", "age": "Unknown",
-                    "peril": feed["default_peril"] if feed["default_peril"] != "All" else "Other",
-                    "alert_level": "Unknown", "magnitude": None, "wind_kmh": None,
-                    "lat": None, "lon": None, "tier": "Info",
-                })
-        try:
-            all_rows.extend(calfire_future.result())
-        except Exception as exc:
-            all_rows.append({
-                "source": "CAL FIRE", "feed": "CAL FIRE Incidents", "url": CALFIRE_URL,
-                "raw_title": "CAL FIRE feed unavailable", "title": "Wildfire: CAL FIRE feed unavailable",
-                "summary": str(exc), "link": "https://www.fire.ca.gov/incidents",
-                "published_utc": None, "published": "Unknown", "age": "Unknown",
-                "peril": "Wildfire", "alert_level": "Unknown", "magnitude": None,
-                "wind_kmh": None, "lat": None, "lon": None, "tier": "Info",
-            })
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        return df
-    df["published_sort"] = pd.to_datetime(df["published_utc"], errors="coerce", utc=True)
-    df = collapse_nhc_storm_products(df)
-    df["event_id"] = df.apply(stable_event_id, axis=1)
-    df["tier_rank"] = df["tier"].map(TIER_ORDER).fillna(9)
-    df["alert_rank"] = df["alert_level"].map(ALERT_ORDER).fillna(9)
-    df["published_sort"] = pd.to_datetime(df["published_utc"], errors="coerce", utc=True)
-    df = df.drop_duplicates(subset=["event_id"], keep="first")
-
-    def dedup_key(r):
-        nhc_key = nhc_active_storm_key(r)
-        if nhc_key:
-            return nhc_key
-        if is_outlook(r["raw_title"], r["summary"]):
-            codes = sorted({c for c, _ in parse_outlook_systems(r["summary"])})
-            return "OUTLOOK|" + ("-".join(codes) if codes else outlook_basin(r["summary"]))
-        return r["event_id"]
-
-    df["dedup_key"] = df.apply(dedup_key, axis=1)
-    # Cross-source cyclone identity: when a named storm appears from both NHC and
-    # GDACS, collapse them onto one shared key. Basin-only GDACS storms (e.g. NW
-    # Pacific typhoons NHC does not issue advisories for) yield no cross key and
-    # keep their own GDACS entry.
-    df["_tc_cross_key"] = df.apply(cross_source_tc_key, axis=1)
-    cross_mask = df["_tc_cross_key"].astype(str).ne("")
-    df.loc[cross_mask, "dedup_key"] = df.loc[cross_mask, "_tc_cross_key"]
-    # Prefer NHC over GDACS for shared storms; within a source, keep the most
-    # recent. CAL FIRE shares NHC's top priority as it never overlaps cyclones.
-    df["source_priority"] = df["source"].map({"NHC": 0, "CAL FIRE": 0, "GDACS": 1}).fillna(2)
-    df = df.sort_values(
-        ["source_priority", "published_sort"],
-        ascending=[True, False],
-        na_position="last",
-        kind="stable",
-    )
-    df = df.drop_duplicates(subset=["dedup_key"], keep="first")
-    df = df.drop(columns=["_tc_cross_key"], errors="ignore")
-    df = df.sort_values(["tier_rank", "alert_rank", "published_sort"], ascending=[True, True, False], na_position="last")
-    return df.reset_index(drop=True)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_news(query, source_domains):
-    q = query.strip()
-    if "when:" not in q.lower():
-        q = f"{q} when:30d"
-    if source_domains:
-        site_filter = " OR ".join(f"site:{d}" for d in source_domains)
-        q = f"{q} ({site_filter})"
-    encoded = urllib.parse.quote(q)
-    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-    parsed = feedparser.parse(url, request_headers=REQUEST_HEADERS)
-    items = []
-    for entry in parsed.entries[:15]:
-        dt = parse_entry_dt(entry)
-        src = ""
-        if entry.get("source"):
-            try:
-                src = clean_html(entry["source"].get("title", ""))
-            except Exception:
-                src = ""
-        items.append({
-            "title": clean_html(entry.get("title", "")),
-            "link": entry.get("link", ""),
-            "source": src,
-            "age": age_label(dt),
-        })
-    return items
-
-
-def news_query_from_row(row):
-    peril = row.get("peril", "Other")
-    raw = str(row.get("raw_title", ""))
-    title = str(row.get("title", ""))
-    summary = str(row.get("summary", ""))
-    year = datetime.now(timezone.utc).year
-
-    if is_outlook(raw, summary):
-        code = row.get("disturbance_code") or ""
-        return f'"{code}" tropical disturbance {outlook_basin(summary)} {year}'.strip()
-    if peril == "Tropical Cyclone":
-        name = extract_tc_identity(raw, summary)
-        status = row.get("status") or "tropical cyclone"
-        return f'"{status} {name}" {year}' if name else f'"{raw}" tropical cyclone {year}'
-    if peril == "Wildfire":
-        fire_name = re.sub(r"^Wildfire:\s*", "", raw, flags=re.IGNORECASE).strip()
-        geography = "California" if row.get("source") == "CAL FIRE" else extract_location(title, summary)
-        return f'"{fire_name}" {geography} wildfire {year}'.strip()
-    if peril == "Flood":
-        location = extract_location(title, summary) or raw
-        return f'"{location}" flood {year}'.strip()
-    base_q = re.sub(r"^(?:red|orange|green) notification for\s+", "", raw, flags=re.IGNORECASE)
-    return f'"{base_q.strip()}" {peril} {year}'.strip()
-
-
-def maps_url(row):
-    lat, lon = row.get("lat"), row.get("lon")
-    if pd.notna(lat) and pd.notna(lon):
-        return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-    q = extract_location(row.get("raw_title", ""), row.get("summary", "")) or row.get("raw_title", "")
-    return f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(q)}"
-
-
-def filter_df(df, min_tier, perils, sources, hours):
-    if df.empty:
-        return df
-    out = df[df["tier_rank"] <= TIER_ORDER[min_tier]].copy()
-    if perils:
-        out = out[out["peril"].isin(perils)]
-    if sources:
-        out = out[out["source"].isin(sources)]
-    if hours:
-        cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(hours=hours))
-        out = out[(out["published_sort"].isna()) | (out["published_sort"] >= cutoff)]
-    return out
-
-
-def tier_badge(tier):
-    return {"Critical": "\U0001F534 Critical", "Watch": "\U0001F7E0 Watch", "Advisory": "\U0001F7E1 Advisory", "Info": "\u26AA Info"}.get(tier, "\u26AA Info")
-
-
-def peril_icon(peril):
-    return {"Tropical Cyclone": "\U0001F300", "Earthquake": "\U0001F30E", "Flood": "\U0001F30A", "Wildfire": "\U0001F525",
-            "Volcano": "\U0001F30B", "Drought": "\u2600\uFE0F", "Other": "\U0001F4CC"}.get(peril, "\U0001F4CC")
-
-
-def _base_geo(fig, height, center=None, show_legend=False):
-    fig.update_geos(
-        projection_type="natural earth",
-        showland=True, landcolor="#3D5C39",
-        showocean=True, oceancolor="#1E3A5F",
-        showcountries=True, countrycolor="#4A6E3F",
-        showcoastlines=True, coastlinecolor="#6B8E5C",
-        lakecolor="#2A4A7C", bgcolor="rgba(0,0,0,0)",
-        center=center,
-    )
-    fig.update_layout(
-        height=height, margin=dict(l=0, r=0, t=30 if show_legend else 0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        showlegend=show_legend,
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
-                    font=dict(color="#E6EAF1", size=12), bgcolor="rgba(0,0,0,0)",
-                    itemclick="toggle", itemdoubleclick="toggleothers"),
-    )
-
-
-def render_map(df, key, height=460, show_peril_toggle=True):
-    m = df.copy()
-    m["lat"] = pd.to_numeric(m["lat"], errors="coerce")
-    m["lon"] = pd.to_numeric(m["lon"], errors="coerce")
-    m = m.dropna(subset=["lat", "lon"])
-    if m.empty:
-        st.info("No mappable events for this view (these feeds didn't include coordinates).")
+def render_hurricane_watch(tropical_systems, jtwc_loading):
+    if jtwc_loading:
+        st.caption("⏳ Loading global JTWC systems in the background...")
+    if not tropical_systems:
+        st.info("No active tropical systems anywhere right now.")
         return
 
-    if show_peril_toggle:
-        present = [p for p in PERIL_ORDER if p in set(m["peril"])]
-        if present and len(present) > 1:
-            if hasattr(st, "segmented_control"):
-                sel = st.segmented_control("Filter perils", present, selection_mode="multi",
-                                           default=present, key=f"{key}_perils")
-            else:
-                sel = st.multiselect("Filter perils", present, default=present, key=f"{key}_perils")
-            if sel:
-                m = m[m["peril"].isin(sel)]
-    if m.empty:
-        st.info("No events for the selected perils.")
-        return
+    render_legends(include_tc=True, include_perils=False)
+    render_world_map([tc_to_map_event(s) for s in tropical_systems], tropical_systems=tropical_systems, height=540, show_tracks=True, key="tc_map")
 
-    m["emoji"] = m["peril"].map(peril_icon)
-    m["hover"] = m["title"] + "<br>" + m["tier"] + " \u00B7 " + m["peril"] + " \u00B7 " + m["source"] + "<br><em>Click to filter & jump to alert</em>"
-    m["peril_lower"] = m["peril"].str.lower().str.replace(" ", "_")
+    storms = [s for s in tropical_systems if not s["invest"]]
+    invests = [s for s in tropical_systems if s["invest"]]
+    ai_on = bool(gemini_key())
 
-    fig = go.Figure()
-    # One trace per tier -> clickable legend filters tiers. Colour halo = tier, emoji = peril.
-    for tier in ["Info", "Advisory", "Watch", "Critical"]:  # critical drawn last (on top)
-        sub = m[m["tier"] == tier]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Scattergeo(
-            lat=sub["lat"], lon=sub["lon"], mode="markers+text",
-            name=f"{tier} ({len(sub)})", legendrank=TIER_ORDER[tier],
-            customdata=sub[["peril", "event_id"]].values,
-            marker=dict(size=TIER_SIZE.get(tier, 10) + 14, color=TIER_HEX.get(tier, "#8C96A0"),
-                        opacity=0.32, line=dict(width=1.6, color=TIER_HEX.get(tier, "#8C96A0"))),
-            text=sub["emoji"], textposition="middle center",
-            textfont=dict(size=TIER_SIZE.get(tier, 10) + 3),
-            hovertext=sub["hover"], hoverinfo="text",
-        ))
-    _base_geo(fig, height, show_legend=True)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"{key}_map")
+    hdr = f"{len(storms)} storm{'s' if len(storms) != 1 else ''}"
+    if invests:
+        hdr += f" · {len(invests)} area{'s' if len(invests) != 1 else ''} of interest"
+    st.subheader(f"Currently monitoring — {hdr}")
+    st.caption("🧠 AI briefs on" if ai_on else "AI briefs off — add GEMINI_API_KEY to .streamlit/secrets.toml to enable.")
 
-    peril_legend = "  ".join(f"{peril_icon(p)} {p}" for p in PERIL_ORDER if p in set(m["peril"]))
-    st.caption(f"Click a tier in the legend to show/hide it (double-click to isolate).  \u00B7  Icon = peril: {peril_legend}  \u00B7  {len(m)} mapped")
+    cols = st.columns(3)
+    for i, s in enumerate(storms):
+        with cols[i % 3]:
+            render_tc_card(s, ai_on=ai_on)
 
-
-def render_locator(row, key, height=240):
-    lat, lon = to_float(row.get("lat")), to_float(row.get("lon"))
-    if lat is None or lon is None:
-        return False
-    fig = go.Figure(go.Scattergeo(
-        lat=[lat], lon=[lon], mode="markers+text",
-        marker=dict(size=26, color=TIER_HEX.get(row.get("tier"), "#F08C14"),
-                    opacity=0.30, line=dict(width=1.4, color=TIER_HEX.get(row.get("tier"), "#F08C14"))),
-        text=[peril_icon(row.get("peril"))], textposition="middle center", textfont=dict(size=16),
-        hovertext=[row.get("title", "")], hoverinfo="text",
-    ))
-    _base_geo(fig, height, center=dict(lat=lat, lon=lon))
-    fig.update_geos(projection_scale=6, center=dict(lat=lat, lon=lon))
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"loc_{key}")
-    return True
-
-
-def render_desktop_alerts(new_major_df, enabled):
-    """Browser desktop notifications for new Critical/Watch events."""
-    payload = []
-    if not new_major_df.empty:
-        for _, r in new_major_df.iterrows():
-            payload.append({
-                "id": "|".join([
-                    str(r.get("event_id", "")), str(r.get("update_type", "")),
-                    ";".join(str(x) for x in (r.get("changes") or [])), str(r.get("published", "")),
-                ]),
-                "title": str(r.get("title", "")),
-                "sub": " \u00B7 ".join(x for x in [str(r.get("update_type", "")),
-                    "; ".join(str(x) for x in (r.get("changes") or [])),
-                    str(r.get("tier", "")), str(r.get("source", ""))] if x),
-            })
-    data = json.dumps(payload)
-    enabled_js = "true" if enabled else "false"
-    html = f"""
-    <div style="font-family:sans-serif;color:#E6EAF1;font-size:13px;display:flex;align-items:center;gap:10px">
-      <button id="gcwEnable" style="background:#F97316;color:#0E1117;border:none;padding:6px 12px;
-        border-radius:6px;cursor:pointer;font-weight:600">\U0001F514 Enable desktop alerts</button>
-      <span id="gcwStatus" style="color:#8A94A6"></span>
-    </div>
-    <script>
-      const events = {data};
-      const autoEnabled = {enabled_js};
-      const statusEl = document.getElementById('gcwStatus');
-      function setStatus(){{
-        if(!('Notification' in window)){{ statusEl.innerText='Not supported in this browser'; return; }}
-        statusEl.innerText = 'Permission: ' + Notification.permission;
-      }}
-      function fire(){{
-        if(!('Notification' in window) || Notification.permission!=='granted') return;
-        let seen = [];
-        try {{ seen = JSON.parse(localStorage.getItem('gcw_seen')||'[]'); }} catch(e) {{ seen=[]; }}
-        events.forEach(function(e){{
-          if(e.id && seen.indexOf(e.id)===-1){{
-            try {{ new Notification('\U0001F310 '+e.title, {{ body: e.sub, tag: e.id }}); }} catch(err) {{}}
-            seen.push(e.id);
-          }}
-        }});
-        localStorage.setItem('gcw_seen', JSON.stringify(seen.slice(-500)));
-      }}
-      document.getElementById('gcwEnable').onclick = function(){{
-        if(!('Notification' in window)) return;
-        Notification.requestPermission().then(function(p){{ setStatus(); if(p==='granted') fire(); }});
-      }};
-      setStatus();
-      if(autoEnabled) fire();
-    </script>
-    """
-    components.html(html, height=48)
-
-
-def render_event_card(row, news_sources, new_ids, observations_lookup=None, ns="", compact=False):
-    is_new = row.get("event_id") in new_ids
-    with st.container(border=True):
-        c1, c2 = st.columns([0.78, 0.22])
-        with c1:
-            head = f"**{tier_badge(row['tier'])} \u00B7 {peril_icon(row['peril'])} {row['peril']} \u00B7 {row['source']}**"
-            if is_new:
-                head += "  \u00B7  :green[\U0001F195 NEW]"
-            st.markdown(head)
-            st.markdown(f"#### {row['title']}")
-            # AI brief: a single plain-language line for named tropical cyclones,
-            # generated from the full bulletin. Strictly optional and cached; if
-            # no key or any failure, nothing renders and the card is unchanged.
-            if (row.get("peril") == "Tropical Cyclone" and row.get("source") == "NHC"
-                    and not is_outlook(row.get("raw_title", ""), row.get("summary", ""))
-                    and gemini_available()):
-                brief = ai_storm_brief(row.get("summary", ""), extract_nhc_storm_name(
-                    row.get("raw_title", ""), row.get("summary", "")))
-                if brief and brief.get("underwriter_summary"):
-                    st.markdown(f":violet[**\U0001F9E0 {brief['underwriter_summary']}**]")
-                    if brief.get("key_threats"):
-                        st.caption("Threats: " + " · ".join(brief["key_threats"]))
-            if row.get("changes"):
-                st.markdown("  ".join(f":blue[**{change}**]" for change in row["changes"]))
-            if row.get("summary"):
-                text = display_summary(row["summary"])
-                if compact:
-                    st.caption(text[:240] + ("..." if len(text) > 240 else ""))
-                else:
-                    st.write(text[:800] + ("..." if len(text) > 800 else ""))
-
-            has_coords = pd.notna(row.get("lat")) and pd.notna(row.get("lon"))
-            event_key = str(row.get("event_id") or tracking_key(row))
-            observations = (observations_lookup or {}).get(event_key)
-            if observations is None:
-                observations = get_event_observations(event_key, limit=200)
-            event_peril = row.get("peril", "")
-            timeline_entries = compute_observation_timeline(observations, peril=event_peril)
-            update_count = len(timeline_entries)
-            if update_count:
-                update_label = "change" if update_count == 1 else "changes"
-                with st.expander(f"Change history ({update_count} {update_label})"):
-                    render_event_timeline(
-                        event_key, peril=event_peril, observations=observations, compact=True
-                    )
-            else:
-                st.caption("No material changes recorded since first observed.")
-            ncol, mcol = st.columns(2)
-            with ncol:
-                with st.expander("\U0001F4F0 Related news"):
-                    news_key = f"news_{ns}_{event_key}"
-                    loaded_news = st.session_state.setdefault("loaded_news", set())
-                    if st.button("Load related news", key=f"load_{news_key}", use_container_width=True):
-                        loaded_news.add(news_key)
-                    if news_key in loaded_news:
-                        query = news_query_from_row(row)
-                        st.caption(f"Searching news for: **{query}**")
-                        items = fetch_news(query, tuple(news_sources))
-                        if not items:
-                            st.info("No related news found for this event yet.")
-                        for it in items:
-                            meta = " \u00B7 ".join(x for x in [it.get("source", ""), it.get("age", "")] if x)
-                            st.markdown(
-                                f"- [{it['title']}]({it['link']})  \n"
-                                f"<span style='color:#8A94A6;font-size:0.8em'>{meta}</span>",
-                                unsafe_allow_html=True,
-                            )
-                    else:
-                        st.caption("News is loaded only when requested.")
-            with mcol:
-                with st.expander("\U0001F4CD Locate"):
-                    if has_coords:
-                        render_locator(row, key=f"{ns}_{row.get('event_id', row.get('title',''))}")
-                    else:
-                        st.caption("No exact coordinates in feed; use the map link below.")
-                    st.link_button("Open in Google Maps", maps_url(row), use_container_width=True)
-        with c2:
-            st.metric("Updated", row["age"])
-            st.caption(f"Published: {format_local_time(row.get('published_utc'))}")
-            if row["alert_level"] != "Unknown":
-                st.caption(f"Alert: {row['alert_level']}")
-            if pd.notna(row.get("magnitude")):
-                st.caption(f"Magnitude: {row['magnitude']}")
-            if clean_optional_text(row.get("status")):
-                st.caption(f"Status: {clean_optional_text(row.get('status'))}")
-            if clean_optional_text(row.get("forecast_status")):
-                forecast_line = f"Forecast: Expected to become {clean_optional_text(row.get('forecast_status'))}"
-                timing = clean_optional_text(row.get("forecast_timing")) or extract_forecast_timing(row.get("summary"))
-                if timing:
-                    forecast_line += f" {timing}"
-                st.caption(forecast_line)
-            if pd.notna(row.get("wind_kmh")):
-                st.caption(f"Wind: {row['wind_kmh']:.0f} km/h")
-            if pd.notna(row.get("pressure_mb")):
-                st.caption(f"Pressure: {row['pressure_mb']:.0f} mb")
-            if pd.notna(row.get("formation_chance")):
-                st.caption(f"Formation chance: {row['formation_chance']:.0f}%")
-            if pd.notna(row.get("acres")):
-                st.caption(f"Area: {row['acres']:,.0f} acres")
-            if pd.notna(row.get("contained_pct")):
-                st.caption(f"Containment: {row['contained_pct']:.0f}%")
-            if row.get("link"):
-                st.link_button("Open source", row["link"], use_container_width=True)
-
-
-def render_cards(df, news_sources, new_ids, observations_lookup=None, ns="", limit=50, compact=False):
-    if df.empty:
-        st.info("No events match the selected filters.")
-        return
-
-    display_df = df.copy()
-    # Apply the intended operational order in every event tab:
-    # Critical, Watch, Advisory, Info; newest source update first within tier.
-    display_df["_display_tier_rank"] = display_df["tier"].map(TIER_ORDER).fillna(9)
-    display_df["_display_updated"] = pd.to_datetime(
-        display_df["published_utc"], errors="coerce", utc=True
-    )
-    display_df = display_df.sort_values(
-        ["_display_tier_rank", "_display_updated"],
-        ascending=[True, False],
-        na_position="last",
-        kind="stable",
-    )
-
-    for _, row in display_df.head(limit).iterrows():
-        render_event_card(row, news_sources, new_ids, observations_lookup=observations_lookup, ns=ns, compact=compact)
-
-
-def render_summary(df, new_count):
-    st.subheader("Global Event Summary")
-    if df.empty:
-        st.info("No events currently monitored under the selected filters.")
-        return
-    pivot = pd.pivot_table(df, index="peril", columns="tier", values="title", aggfunc="count", fill_value=0)
-    for col in ["Critical", "Watch", "Advisory", "Info"]:
-        if col not in pivot.columns:
-            pivot[col] = 0
-    pivot = pivot[["Critical", "Watch", "Advisory", "Info"]]
-    pivot["Total"] = pivot.sum(axis=1)
-    pivot = pivot.reindex([p for p in PERIL_ORDER if p in pivot.index])
-    total_row = pivot.sum(axis=0).to_frame().T
-    total_row.index = ["ALL PERILS"]
-    display = pd.concat([pivot, total_row])
-    st.dataframe(
-        display, use_container_width=True,
-        column_config={
-            "Critical": st.column_config.NumberColumn("\U0001F534 Critical"),
-            "Watch": st.column_config.NumberColumn("\U0001F7E0 Watch"),
-            "Advisory": st.column_config.NumberColumn("\U0001F7E1 Advisory"),
-            "Info": st.column_config.NumberColumn("\u26AA Info"),
-            "Total": st.column_config.NumberColumn("\u03A3 Total"),
-        },
-    )
-    caption = f"Monitoring {int(display.loc['ALL PERILS','Total'])} events across {len(pivot)} peril types."
-    if new_count:
-        caption += f"  \u00B7  \U0001F195 {new_count} new since last refresh."
-    st.caption(caption)
-
-
-def render_table(df, new_ids):
-    if df.empty:
-        st.info("No events match the selected filters.")
-        return
-    view = df.copy()
-    view["new"] = view["event_id"].isin(new_ids).map({True: "\U0001F195", False: ""})
-    cols = ["new", "tier", "peril", "source", "title", "age", "published", "link"]
-    st.dataframe(
-        view[cols], use_container_width=True, hide_index=True,
-        column_config={
-            "link": st.column_config.LinkColumn("Link"),
-            "new": "New", "tier": "Tier", "peril": "Peril", "source": "Source",
-            "title": "Event", "age": "Age", "published": "Published",
-        },
-    )
-
-
-def render_digest(filtered, new_ids):
-    st.subheader("Session Digest")
-    st.caption("A running summary of what has changed since you opened the dashboard. "
-               "Useful as a quick written brief; a true daily AI write-up can be added later.")
-    if filtered.empty:
-        st.info("Nothing to summarise yet.")
-        return
-
-    new_df = filtered[filtered["event_id"].isin(new_ids)]
-    crit = filtered[filtered["tier"] == "Critical"]
-    watch = filtered[filtered["tier"] == "Watch"]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("New since last refresh", len(new_df))
-    c2.metric("Critical now", len(crit))
-    c3.metric("Watch now", len(watch))
-
-    lines = []
-    lines.append(f"As of {datetime.now().strftime('%Y-%m-%d %H:%M')}, monitoring {len(filtered)} events "
-                 f"({len(crit)} critical, {len(watch)} watch).")
-    by_peril = filtered.groupby("peril")["title"].count().sort_values(ascending=False)
-    if not by_peril.empty:
-        parts = [f"{peril_icon(p)} {n} {p.lower()}" for p, n in by_peril.items()]
-        lines.append("Active mix: " + ", ".join(parts) + ".")
-    if not new_df.empty:
-        lines.append("")
-        lines.append("New / updated this refresh:")
-        for _, r in new_df.head(15).iterrows():
-            lines.append(f"  \u2022 [{r['tier']}] {r['title']} ({r['source']}, {r['age']})")
+    st.markdown("---")
+    st.subheader(f"Formation outlook — {len(invests)} area{'s' if len(invests) != 1 else ''} of interest")
+    if not invests:
+        st.caption("No areas of interest being monitored right now.")
     else:
-        lines.append("No new events since the last refresh.")
+        ocols = st.columns(3)
+        for i, s in enumerate(invests):
+            pr = s.get("prob") or {}
+            p2, p7, risk = pr.get("p2"), pr.get("p7"), pr.get("risk")
+            with ocols[i % 3]:
+                st.markdown(
+                    f"""
+                    <div class="cw-card">
+                        <span class="cw-chip">Invest</span>
+                        <h4 style="margin:10px 0 5px 0">{s['name']}</h4>
+                        <div>{risk + ' formation risk' if risk else 'Area of interest'}</div>
+                        <div class="cw-muted" style="margin-top:8px">
+                            48-hour <b>{f'{p2}%' if p2 is not None else '—'}</b> ·
+                            7-day <b>{f'{p7}%' if p7 is not None else '—'}</b><br/>
+                            {s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-    digest_text = "\n".join(lines)
-    st.text_area("Copyable brief", digest_text, height=260)
-    st.download_button("Download digest (.txt)", digest_text,
-                       file_name=f"cat_watch_digest_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
-                       use_container_width=False)
+
+def render_other_perils(gdacs_events, calfire_events):
+    all_events = gdacs_events + calfire_events
+    st.caption("GDACS tropical cyclones are intentionally excluded here because hurricanes are handled by the NHC/JTWC layer.")
+
+    if not all_events:
+        st.info("No non-cyclone GDACS/CAL FIRE events available right now, or the feeds could not be loaded.")
+        return
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    with c1:
+        perils = [p for p in PERIL_ORDER if p != "Tropical Cyclone" and any(e.get("peril") == p for e in all_events)]
+        selected_perils = st.multiselect("Perils", perils, default=perils, key="other_perils_filter")
+    with c2:
+        sources = sorted({e.get("source") for e in all_events if e.get("source")})
+        selected_sources = st.multiselect("Sources", sources, default=sources, key="other_sources_filter")
+    with c3:
+        min_sev = st.selectbox("Minimum severity", ["Info", "Advisory", "Watch", "Critical"], index=0, key="other_sev_filter")
+
+    threshold = severity_rank(min_sev)
+    filtered = [
+        e for e in all_events
+        if e.get("peril") in selected_perils
+        and e.get("source") in selected_sources
+        and severity_rank(e.get("severity")) <= threshold
+    ]
+    filtered.sort(key=lambda e: (severity_rank(e.get("severity")), ALERT_ORDER.get(e.get("alert_level"), 9), e.get("peril", ""), e.get("title", "")))
+
+    render_legends(include_tc=False, include_perils=True)
+    render_world_map(filtered, tropical_systems=[], height=500, show_tracks=False, key="other_map")
+
+    st.subheader(f"Current non-cyclone events — {len(filtered)}")
+    cols = st.columns(2)
+    for i, event in enumerate(filtered[:60]):
+        with cols[i % 2]:
+            render_event_card(event)
 
 
-def update_new_ids(current_ids, refresh_token):
-    ss = st.session_state
-    if "seen_ids" not in ss:
-        ss.seen_ids = set(current_ids)
-        ss.new_ids = set()
-        ss.last_token = refresh_token
-    elif refresh_token != ss.last_token:
-        ss.new_ids = set(current_ids) - ss.seen_ids
-        ss.seen_ids |= set(current_ids)
-        ss.last_token = refresh_token
-    return ss.new_ids
+def render_data_table(tropical_systems, gdacs_events, calfire_events):
+    rows = []
+    for s in tropical_systems:
+        rows.append(tc_to_map_event(s))
+    rows.extend(gdacs_events)
+    rows.extend(calfire_events)
+    if not rows:
+        st.info("No events loaded.")
+        return
+    df = pd.DataFrame(rows)
+    keep = ["severity", "peril", "source", "title", "metric_text", "time", "lat", "lon", "url"]
+    for col in keep:
+        if col not in df.columns:
+            df[col] = None
+    df["severity_rank"] = df["severity"].map(SEVERITY_ORDER).fillna(9)
+    df = df.sort_values(["severity_rank", "peril", "source", "title"]).drop(columns=["severity_rank"])
+    st.dataframe(
+        df[keep],
+        use_container_width=True,
+        hide_index=True,
+        column_config={"url": st.column_config.LinkColumn("Source")},
+    )
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 
 def app():
-    st.set_page_config(page_title=APP_TITLE, page_icon="\U0001F310", layout="wide")
-    st.title("\U0001F310 Global Cat Watch")
-    st.caption("GDACS + NHC + CAL FIRE catastrophe monitor with maps, news lookup and desktop alerts.")
-    
+    st.title("🌍 CatWatch")
+    st.caption("Morning global catastrophe monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS/CAL FIRE")
 
-    with st.sidebar:
-        st.header("Controls")
-        auto_refresh = st.toggle("Auto-refresh", value=True)
-        refresh_minutes = st.number_input("Refresh interval, minutes", 5, 60, DEFAULT_REFRESH_MINUTES, 5)
-        auto_count = 0
-        if auto_refresh and st_autorefresh:
-            auto_count = st_autorefresh(interval=int(refresh_minutes * 60 * 1000), key="cat_watch_refresh")
-        elif auto_refresh:
-            st.caption("Install streamlit-autorefresh to enable auto refresh.")
-        if st.button("Refresh now", use_container_width=True):
-            st.session_state.refresh_clicks = st.session_state.get("refresh_clicks", 0) + 1
-            st.cache_data.clear()
-            st.rerun()
+    tropical_systems, jtwc_loading = get_tropical_systems()
+    gdacs_events = load_gdacs_events()
+    calfire_events = load_calfire_events()
 
-        st.divider()
-        desktop_alerts = st.toggle("Desktop alerts", value=False)
-        alert_material = st.checkbox("Material status and metric changes", value=True, disabled=not desktop_alerts)
-        alert_major = st.checkbox("New Critical/Watch events", value=True, disabled=not desktop_alerts)
-        st.divider()
-        time_window = st.selectbox(
-            "Show events updated within",
-            ["24 hours", "2 days", "7 days", "30 days", "All available"],
-            index=1,
-            help=(
-                "Filters on each event's most recent update. Active systems that "
-                "keep issuing advisories stay visible; a storm that has gone "
-                "silent (e.g. dissipated) drops off once it passes this threshold. "
-                "NHC/CPHC issue advisories roughly every 6 hours for active "
-                "cyclones, so a 2-day silence usually means it is no longer active."
-            ),
-        )
-        hours_lookup = {"24 hours": 24, "2 days": 48, "7 days": 168, "30 days": 720, "All available": None}
-        min_tier = st.selectbox("Minimum tier", ["Critical", "Watch", "Advisory", "Info"], index=2)
-        perils = st.multiselect("Perils", PERIL_ORDER, default=PERIL_ORDER)
-        sources = st.multiselect("Sources", ["GDACS", "NHC", "CAL FIRE"], default=["GDACS", "NHC", "CAL FIRE"])
-
-        st.divider()
-        st.subheader("News filter")
-        news_labels = st.multiselect("Preferred news sources (blank = all)", list(NEWS_SOURCES.keys()), default=[])
-        news_sources = [NEWS_SOURCES[l] for l in news_labels]
-        st.divider()
-        with st.expander("System status"):
-            supabase_ok, supabase_message = supabase_health_check()
-            if supabase_ok:
-                st.success(supabase_message)
-            else:
-                st.warning(supabase_message)
-            st.caption("Persistent history records only changed event states.")
-            prior_history_status = st.session_state.get("history_write_status", "")
-            if prior_history_status:
-                if "error" in prior_history_status.lower():
-                    st.warning(prior_history_status)
-                else:
-                    st.caption(prior_history_status)
-
-    refresh_token = f"{auto_count}:{st.session_state.get('refresh_clicks', 0)}"
-
-    df = load_events()
-    history_write_status = ""
-    if not df.empty:
-        df = material_changes(df, refresh_token)
-        if supabase_ok:
-            df, history_write_status = persist_event_history(df, client=supabase_client())
-
-    if df.empty:
-        st.error("No feed items loaded. Check connectivity or source availability.")
-        return
-    st.session_state.history_write_status = history_write_status
-
-    new_ids = update_new_ids(set(df["event_id"]), refresh_token)
-    filtered = filter_df(df, min_tier, perils, sources, hours_lookup[time_window])
-    new_visible = len(set(filtered["event_id"]) & new_ids) if not filtered.empty else 0
-    visible_event_keys = filtered["event_id"].astype(str).unique().tolist() if not filtered.empty else []
-    observations_lookup = get_observations_for_events(visible_event_keys, client=supabase_client()) if supabase_ok else {}
-
-    major = filtered[filtered["tier"].isin(["Critical", "Watch"])].copy()
-    major["_major_tier_rank"] = major["tier"].map({"Critical": 0, "Watch": 1}).fillna(9)
-    major["_major_updated"] = pd.to_datetime(major["published_utc"], errors="coerce", utc=True)
-    major = major.sort_values(
-        ["_major_tier_rank", "_major_updated"],
-        ascending=[True, False],
-        na_position="last",
-        kind="stable",
-    )
-
-    if desktop_alerts:
-        alert_frames = []
-        if alert_major:
-            alert_frames.append(major[major["event_id"].isin(new_ids)])
-        if alert_material:
-            alert_frames.append(filtered[filtered["is_material_update"]])
-        alert_df = pd.concat(alert_frames, ignore_index=True).drop_duplicates(subset=["event_id"]) if alert_frames else filtered.iloc[0:0]
-        with st.sidebar:
-            st.caption("Browser notification permission")
-            render_desktop_alerts(alert_df, enabled=True)
-
-    # Map as hero header
-    st.subheader("Global Event Map")
-    render_map(filtered, key="major", height=560)
-    
-    # Single tabbed alert view. This replaces the duplicated quick-filter
-    # buttons and the separate Critical & Watch alert section.
-    st.divider()
-    tabs = st.tabs([
-        "All Perils",
-        "Tropical Cyclone",
-        "Wildfire",
-        "Earthquake",
-        "Flood",
-        "Other",
-        "Event History",
+    tab_overview, tab_hurricanes, tab_other, tab_data = st.tabs([
+        "Overview",
+        "Hurricanes",
+        "Other Perils",
+        "Data",
     ])
 
-    tab_views = [
-        ("All Perils", filtered, "all", False),
-        ("Tropical Cyclone", filtered[filtered["peril"] == "Tropical Cyclone"], "tc", False),
-        ("Wildfire", filtered[filtered["peril"] == "Wildfire"], "wf", False),
-        ("Earthquake", filtered[filtered["peril"] == "Earthquake"], "eq", False),
-        ("Flood", filtered[filtered["peril"] == "Flood"], "fl", False),
-        (
-            "Other",
-            filtered[~filtered["peril"].isin([
-                "Tropical Cyclone", "Wildfire", "Earthquake", "Flood"
-            ])],
-            "other",
-            True,
-        ),
-        ("Event History", None, "history", False),
-    ]
+    with tab_overview:
+        render_overview(tropical_systems, gdacs_events, calfire_events, jtwc_loading)
 
-    for tab, (label, view_df, namespace, compact) in zip(tabs, tab_views):
-        with tab:
-            if namespace == "history":
-                render_history_tab()
-            else:
-                st.subheader(label)
-                if view_df.empty:
-                    st.caption(f"No {label.lower()} events currently.")
-                else:
-                    render_cards(
-                        view_df,
-                        news_sources,
-                        new_ids,
-                        observations_lookup=observations_lookup,
-                        ns=namespace,
-                        compact=compact,
-                    )
+    with tab_hurricanes:
+        render_hurricane_watch(tropical_systems, jtwc_loading)
+
+    with tab_other:
+        render_other_perils(gdacs_events, calfire_events)
+
+    with tab_data:
+        render_data_table(tropical_systems, gdacs_events, calfire_events)
+
+    components.html(
+        """
+        <script>
+        setTimeout(function(){ window.parent.location.reload(); }, 15 * 60 * 1000);
+        </script>
+        """,
+        height=0,
+    )
+
+    if jtwc_loading:
+        time.sleep(4)
+        st.rerun()
+
+
 if __name__ == "__main__":
     app()
