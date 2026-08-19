@@ -107,6 +107,13 @@ GDACS_ALERT_COLOR = {
     "Unknown": [150, 160, 175],
 }
 
+CALFIRE_TRAFFIC_COLOR = {
+    "Critical": [230, 25, 75],   # 100k+ acres
+    "Watch": [255, 150, 35],     # 10k+ acres
+    "Advisory": [70, 210, 110],  # 1k+ acres
+    "Info": [150, 160, 175],     # below 1k acres or unknown
+}
+
 # Tropical-cyclone category palette. Single source of truth for map + legend.
 TC_PALETTE = {
     "Cat 5": [230, 25, 75],
@@ -864,7 +871,7 @@ def load_calfire_events():
             "url": url,
             "metrics": {"acres": acres, "contained_pct": contained},
             "metric_text": " · ".join(metric_bits),
-            "color": SEVERITY_COLOR.get(severity, SEVERITY_COLOR["Info"]),
+            "color": CALFIRE_TRAFFIC_COLOR.get(severity, CALFIRE_TRAFFIC_COLOR["Info"]),
         })
     return events
 
@@ -1076,7 +1083,7 @@ def render_world_map(events, tropical_systems=None, height=560, show_tracks=True
             initial_view_state=pdk.ViewState(latitude=12, longitude=5, zoom=1.15),
             layers=layers,
             tooltip={
-                "html": "<div style='border-left:4px solid {hover_accent};padding-left:8px'><b>{hover_title}</b><br/><span style='color:#9aa4b2'>{hover_meta}</span><br/><span>{hover_body}</span></div>",
+                "html": "<div style='border-left:4px solid {hover_accent};padding-left:8px'><b style='color:{hover_title_color}'>{hover_title}</b><br/><span style='color:#9aa4b2'>{hover_meta}</span><br/><span>{hover_body}</span></div>",
                 "style": {
                     "backgroundColor": "#12151c",
                     "color": "#e6e9ef",
@@ -1491,18 +1498,23 @@ def hover_fields_for_event(event):
     summary = display_summary(event.get("summary", ""), max_len=180)
     color = event.get("color") or PERIL_META.get(peril, PERIL_META["Other"])["color"]
     r, g, b = color
+    title_color = f"rgb({r},{g},{b})"
 
     if source == "GDACS":
         alert = event.get("alert_level", "Unknown")
         if alert != "Unknown":
             ar, ag, ab = GDACS_ALERT_COLOR.get(alert, GDACS_ALERT_COLOR["Unknown"])
-            hover_title = f'<span style="color:rgb({ar},{ag},{ab});font-weight:800">[{alert}]</span> {title}'
+            hover_title = f"[{alert}] {title}"
+            title_color = f"rgb({ar},{ag},{ab})"
         else:
             hover_title = title
         hover_meta = " · ".join(x for x in [source, peril, metric, time_text] if x)
     elif source == "CAL FIRE":
-        hover_title = title
-        hover_meta = " · ".join(x for x in [source, "acreage size band", event.get("severity", "Info"), metric, time_text] if x)
+        # This is a CatWatch acreage band, not an official CAL FIRE alert level.
+        band = event.get("severity", "Info")
+        band_label = {"Critical": "Red", "Watch": "Orange", "Advisory": "Green", "Info": "Grey"}.get(band, "Grey")
+        hover_title = f"[{band_label}] {title}"
+        hover_meta = " · ".join(x for x in [source, "CatWatch acreage band", band, metric, time_text] if x)
     elif source == "GDELT":
         hover_title = f"[Civil Unrest] {title}"
         hover_meta = " · ".join(x for x in [source, metric, time_text] if x)
@@ -1513,11 +1525,11 @@ def hover_fields_for_event(event):
     hover_body = " · ".join(x for x in [summary, age] if x)
     return {
         "hover_title": hover_title,
+        "hover_title_color": title_color,
         "hover_meta": hover_meta,
         "hover_body": hover_body,
         "hover_accent": f"rgb({r},{g},{b})",
     }
-
 
 def render_peril_tab(title, events, caption=None, icon=None):
     if caption:
@@ -1536,7 +1548,7 @@ def render_peril_tab(title, events, caption=None, icon=None):
     filtered = sort_events_for_live_view(filtered)
 
     if title == "CA Wildfire":
-        render_non_hurricane_summary(filtered, source_hint="CAL FIRE map colors are internal acreage size bands, not official CAL FIRE severity colors.")
+        render_non_hurricane_summary(filtered, source_hint="CAL FIRE map colors are CatWatch traffic-light acreage bands, not official CAL FIRE alert colors.")
     else:
         render_non_hurricane_summary(filtered)
     render_static_legend(include_tc=False, include_perils=True, perils=selected)
@@ -1590,7 +1602,7 @@ def app():
     with tabs[1]:
         render_hurricane_watch(tropical_systems, jtwc_loading)
     with tabs[2]:
-        render_peril_tab("CA Wildfire", ca_wildfire_events, caption="Active California wildfire incidents from CAL FIRE. Map color is an internal acreage size band: red 100k+ acres, orange 10k+, yellow 1k+, grey below 1k or unknown.", icon="🔥")
+        render_peril_tab("CA Wildfire", ca_wildfire_events, caption="Active California wildfire incidents from CAL FIRE. Map color is a CatWatch traffic-light acreage band: red 100k+ acres, orange 10k+, green 1k+, grey below 1k or unknown.", icon="🔥")
     with tabs[3]:
         render_peril_tab("Global Wildfire", global_wildfire_events, caption="Global wildfire/forest fire alerts from GDACS. CAL FIRE incidents are kept in the separate CA Wildfire tab.", icon="🔥")
     with tabs[4]:
