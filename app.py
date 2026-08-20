@@ -1583,7 +1583,25 @@ def render_peril_tab(title, events, caption=None, icon=None):
     gdacs_alerts = select_gdacs_alert_levels(filtered, key=f"{title.lower().replace(' ', '_')}_gdacs_alerts")
     filtered = filter_events_by_gdacs_alert(filtered, gdacs_alerts)
     filtered = [e for e in filter_events_by_recency(filtered, max_age_hours) if max_age_hours is None or event_timestamp(e) is not None]
-    filtered = sort_events_for_live_view(filtered)
+
+    def newest_first(event):
+        dt = event_timestamp(event)
+        return -(dt.timestamp() if dt else 0)
+
+    if title == "CA Wildfire":
+        # CAL FIRE is one source/feed: latest update is the clearest ordering.
+        filtered = sorted(filtered, key=lambda event: (newest_first(event), event.get("title", "")))
+    else:
+        # GDACS tabs: official Red, Orange, Green tier first, then newest update
+        # within each tier. Unknown alerts fall after the traffic-light tiers.
+        filtered = sorted(
+            filtered,
+            key=lambda event: (
+                ALERT_ORDER.get(event.get("alert_level", "Unknown"), 9),
+                newest_first(event),
+                event.get("title", ""),
+            ),
+        )
 
     if title == "CA Wildfire":
         render_non_hurricane_summary(filtered, source_hint="CAL FIRE map colors are CatWatch traffic-light acreage bands, not official CAL FIRE alert colors.")
@@ -1592,10 +1610,8 @@ def render_peril_tab(title, events, caption=None, icon=None):
     render_static_legend(include_tc=False, include_perils=True, perils=selected)
     render_world_map(filtered, tropical_systems=[], height=500, show_tracks=False, key=f"{title}_map", marker_style="Severity colors")
     st.subheader(f"{icon or ''} {title} — {len(filtered)}")
-    cols = st.columns(2)
-    for i, event in enumerate(filtered[:60]):
-        with cols[i % 2]:
-            render_event_card(event)
+    for event in filtered[:60]:
+        render_event_card(event)
 
 def render_civil_unrest_tab(civil_unrest_events):
     st.info("Civil unrest monitoring is temporarily disabled while the source is being reworked.")
