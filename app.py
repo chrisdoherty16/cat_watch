@@ -1629,10 +1629,10 @@ def render_monitoring_summary(map_events):
 
 
 def select_marker_style(key):
-    options = ["Severity colors", "Peril colors"]
+    options = ["Severity", "Peril"]
     if hasattr(st, "segmented_control"):
-        return st.segmented_control("Map colors", options, default=options[0], key=key)
-    return st.radio("Map colors", options, horizontal=True, key=key)
+        return st.segmented_control("Display", options, default=options[0], key=key)
+    return st.radio("Display", options, horizontal=True, key=key)
 
 def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading):
     now = datetime.now(timezone.utc)
