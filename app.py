@@ -90,7 +90,7 @@ PERIL_META = {
     "Wildfire": {"icon": "🔥", "color": [255, 120, 35]},
     "Volcano": {"icon": "🌋", "color": [210, 80, 255]},
     "Drought": {"icon": "☀️", "color": [245, 200, 70]},
-    "Civil Unrest": {"icon": "⚠️", "color": [190, 170, 255]},
+    "Civil Unrest": {"icon": "⚠️", "color": [35, 205, 190]},
     "Other": {"icon": "📌", "color": [160, 170, 185]},
 }
 
@@ -271,6 +271,14 @@ def display_summary(text, max_len=420):
     text = text.replace("[unknown]", "n/a")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len] + ("..." if len(text) > max_len else "")
+
+
+def capitalize_first(text):
+    text = str(text or "").strip()
+    for index, char in enumerate(text):
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1:]
+    return text
 
 # ---------------------------------------------------------------------------
 # Tropical cyclone helpers - NHC/JTWC via Tropycal
@@ -1136,8 +1144,12 @@ def render_static_legend(include_tc=True, include_perils=True, perils=None):
         st.markdown(" ".join(bits), unsafe_allow_html=True)
 
 
-def select_map_layers(available_perils, key, label="Mapped Perils"):
-    ordered = [p for p in PERIL_ORDER if p in available_perils]
+def select_map_layers(available_perils, key, label="Mapped Perils", show_all=False):
+    # Overview always exposes the complete supported peril taxonomy so the
+    # controls and legend remain visually aligned, even when a feed currently
+    # has no Volcano, Civil Unrest, or Other records.
+    source_perils = PERIL_ORDER if show_all else [p for p in PERIL_ORDER if p in available_perils]
+    ordered = [p for p in PERIL_ORDER if p in source_perils]
     if not ordered:
         return []
     display = [f"{peril_icon(p)} {p}" for p in ordered]
@@ -1303,7 +1315,7 @@ def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest
         st.caption("⏳ Loading global JTWC tropical systems in the background...")
     render_monitoring_summary(all_events)
     available = sorted({e.get("peril") for e in all_events if e.get("peril")})
-    selected = select_map_layers(available, key="overview_map_layers")
+    selected = select_map_layers(available, key="overview_map_layers", show_all=True)
     filtered_events = filter_events_by_peril(all_events, selected)
     gdacs_alerts = select_gdacs_alert_levels(filtered_events, key="overview_gdacs_alerts")
     filtered_events = filter_events_by_gdacs_alert(filtered_events, gdacs_alerts)
@@ -1516,11 +1528,11 @@ def render_gdelt_diagnostics(events=None):
 def hover_fields_for_event(event):
     source = event.get("source", "")
     peril = event.get("peril", "Other")
-    title = event.get("title", "Untitled event")
+    title = capitalize_first(event.get("title", "Untitled event"))
     metric = event.get("metric_text") or ""
     time_text = event.get("time", "—")
     age = event.get("age", "")
-    summary = display_summary(event.get("summary", ""), max_len=180)
+    summary = capitalize_first(display_summary(event.get("summary", ""), max_len=180))
     color = event.get("color") or PERIL_META.get(peril, PERIL_META["Other"])["color"]
     r, g, b = color
     title_color = f"rgb({r},{g},{b})"
@@ -1529,7 +1541,8 @@ def hover_fields_for_event(event):
         alert = event.get("alert_level", "Unknown")
         if alert != "Unknown":
             ar, ag, ab = GDACS_ALERT_COLOR.get(alert, GDACS_ALERT_COLOR["Unknown"])
-            hover_title = f"[{alert}] " + title.replace(f"{alert} ", "")
+            clean_title = re.sub(rf"^{re.escape(alert)}\s+", "", title, flags=re.IGNORECASE)
+            hover_title = f"[{alert}] {capitalize_first(clean_title)}"
             title_color = f"rgb({ar},{ag},{ab})"
         else:
             hover_title = title
