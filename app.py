@@ -13,6 +13,7 @@ Likely dependencies beyond your current hurricane app:
 """
 
 import io
+import json
 import math
 import re
 import time
@@ -155,6 +156,8 @@ st.markdown(
     .cw-orange { background:#3b2714; color:#ffb35c; }
     .cw-yellow { background:#393414; color:#ffe066; }
     .cw-grey { background:#232833; color:#cdd3de; }
+.cw-ai-response { color:#ff8ac4; font-weight:650; }
+.cw-ai-icon { color:#ff8ac4; font-size:1.05rem; margin-right:0.35rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -608,7 +611,7 @@ def ai_available():
 
 def valid_ai_text(text):
     text = str(text or "").strip()
-    if len(text) < 25 or len(text) > 700:
+    if len(text) < 10 or len(text) > 6000:
         return None
     lowered = text.lower()
     if any(token in lowered for token in ("error:", "unable to comply", "i cannot access")):
@@ -616,34 +619,52 @@ def valid_ai_text(text):
     return text
 
 
-def openai_compatible_brief(url, api_key, model, prompt, provider_label):
+def openai_compatible_brief(url, api_key, model, prompt, provider_label, max_tokens=120):
     try:
+        request_body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if provider_label == "Groq" and "gpt-oss" in model.lower():
+            request_body.update({
+                "max_completion_tokens": max(1500, max_tokens),
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden",
+            })
+        else:
+            request_body.update({
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+            })
+
         response = requests.post(
             url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 120,
-            },
-            timeout=12,
+            json=request_body,
+            timeout=30,
         )
         response.raise_for_status()
         payload = response.json()
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-        text = valid_ai_text(content)
-        if not text:
+        choice = (payload.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        answer = valid_ai_text(content)
+        if not answer:
+            usage = payload.get("usage") or {}
+            _AI_ERROR["msg"] = (
+                f"{provider_label}: HTTP {response.status_code}, blank content, "
+                f"finish_reason={choice.get('finish_reason', 'unknown')}, "
+                f"completion_tokens={usage.get('completion_tokens', 'unknown')}"
+            )
             return None
         actual_model = str(payload.get("model") or model).strip()
-        return text, f"{provider_label} · {actual_model}"
+        return answer, f"{provider_label} · {actual_model}"
     except Exception as exc:
-        _AI_ERROR["msg"] = f"{provider_label}: {type(exc).__name__}: {str(exc)[:180]}"
+        _AI_ERROR["msg"] = f"{provider_label}: {type(exc).__name__}: {str(exc)[:240]}"
         return None
-
 
 def gemini_key():
     return secret_value("GEMINI_API_KEY")
@@ -679,6 +700,198 @@ def gemini_model():
     if flash:
         return sorted(flash, reverse=True)[0]
     return "gemini-2.5-flash"
+
+
+def build_dashboard_context(tropical_systems, current_events):
+    """Build a compact ranked snapshot that stays safely below provider payload limits."""
+    tropical = []
+    for system in tropical_systems:
+        prob = system.get("prob") or {}
+        outlook = system.get("outlook") or {}
+        tropical.append({
+            "name": system.get("name"),
+            "source": system.get("source"),
+            "basin": system.get("basin"),
+            "status": system.get("klass"),
+            "invest": bool(system.get("invest")),
+            "winds_kt": system.get("vmax"),
+            "pressure_mb": system.get("mslp"),
+            "movement": system.get("move"),
+            "updated": system.get("time"),
+            "formation_48h_pct": prob.get("p2"),
+            "formation_7d_pct": prob.get("p7"),
+            "formation_risk": prob.get("risk"),
+            "forecast_peak": outlook.get("peak_klass"),
+            "forecast_trend": outlook.get("trend"),
+            "forecast_by": outlook.get("by"),
+        })
+
+    def event_rank(event):
+        dt = event.get("updated_utc") or event.get("published_utc")
+        timestamp = dt.timestamp() if dt is not None and hasattr(dt, "timestamp") else 0
+        return (
+            ALERT_ORDER.get(event.get("alert_level", "Unknown"), 9),
+            severity_rank(event.get("severity")),
+            -timestamp,
+        )
+
+    grouped = {}
+    for event in current_events:
+        grouped.setdefault(event.get("peril", "Other"), []).append(event)
+
+    events_by_peril = {}
+    for peril in PERIL_ORDER:
+        if peril == "Tropical Cyclone" or peril not in grouped:
+            continue
+        ranked = sorted(grouped[peril], key=event_rank)[:12]
+        events_by_peril[peril] = [
+            {
+                "title": event.get("title"),
+                "source": event.get("source"),
+                "severity": event.get("severity"),
+                "alert_level": event.get("alert_level"),
+                "metric": event.get("metric_text"),
+                "updated": event.get("time"),
+                "age": event.get("age"),
+            }
+            for event in ranked
+        ]
+
+    snapshot = {
+        "snapshot_time_utc": datetime.now(timezone.utc).isoformat(),
+        "tropical_systems": tropical,
+        "event_counts_by_peril": {peril: len(items) for peril, items in grouped.items()},
+        "top_current_events_by_peril": events_by_peril,
+    }
+    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str)
+    return payload[:45000]
+
+def answer_dashboard_question(question, dashboard_context):
+    prompt = (
+        "You are the CatWatch dashboard assistant. Answer using ONLY the supplied dashboard snapshot. "
+        "Do not use outside knowledge. If the snapshot does not contain enough information, say so plainly. "
+        "Distinguish current status from forecast status. For comparisons, prioritize official alert level, "
+        "CatWatch severity, wind speed, acreage, magnitude, and recency as available. Keep the answer concise "
+        "and operational, normally 2-6 bullets. Do not invent locations, impacts, probabilities, or rankings.\n\n"
+        f"DASHBOARD SNAPSHOT:\n{dashboard_context}\n\nUSER QUESTION:\n{question}"
+    )
+
+    client, model = gemini_client(), gemini_model()
+    if client is not None and model:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=500,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            answer = valid_ai_text(response.text)
+            if answer:
+                return answer, f"Google · {model}"
+        except Exception as exc:
+            _AI_ERROR["msg"] = f"Google: {type(exc).__name__}: {str(exc)[:180]}"
+
+    groq_key = secret_value("GROQ_API_KEY")
+    if groq_key:
+        result = openai_compatible_brief(
+            GROQ_CHAT_URL,
+            groq_key,
+            secret_value("GROQ_MODEL", GROQ_DEFAULT_MODEL),
+            prompt,
+            "Groq",
+            max_tokens=500,
+        )
+        if result:
+            return result
+
+    llama_key = secret_value("LLAMA_API_KEY")
+    llama_model = secret_value("LLAMA_MODEL")
+    if llama_key and llama_model:
+        result = openai_compatible_brief(
+            LLAMA_CHAT_URL, llama_key, llama_model, prompt, "Meta Llama", max_tokens=500
+        )
+        if result:
+            return result
+
+    openrouter_key = secret_value("OPENROUTER_API_KEY")
+    if openrouter_key:
+        result = openai_compatible_brief(
+            OPENROUTER_CHAT_URL,
+            openrouter_key,
+            OPENROUTER_FREE_MODEL,
+            prompt,
+            "OpenRouter",
+            max_tokens=500,
+        )
+        if result:
+            return result
+
+    return None
+
+
+def render_mission_control_chat(tropical_systems, current_events):
+    st.markdown("---")
+    st.subheader("Ask CatWatch")
+    st.caption("Query the current dashboard snapshot across tropical cyclones, GDACS and CAL FIRE.")
+
+    if not ai_available():
+        st.info("Add a supported AI API key to .streamlit/secrets.toml to enable dashboard questions.")
+        return
+
+    if "catwatch_chat" not in st.session_state:
+        st.session_state.catwatch_chat = []
+
+    for message in st.session_state.catwatch_chat:
+        avatar = "💗" if message["role"] == "assistant" else None
+        with st.chat_message(message["role"], avatar=avatar):
+            if message["role"] == "assistant" and message.get("model"):
+                st.markdown(
+                    f'<div class="cw-ai-response">{message["content"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(message["content"])
+            if message.get("model"):
+                st.caption(f"AI model: {message['model']}")
+
+    question = st.chat_input(
+        "Ask about current severe events, active storms, invests or formation outlooks...",
+        key="catwatch_question",
+    )
+    if not question:
+        st.caption(
+            "Examples: “What are the most severe events in each peril?” · "
+            "“Are any Atlantic invests being monitored?”"
+        )
+        return
+
+    st.session_state.catwatch_chat.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    context = build_dashboard_context(tropical_systems, current_events)
+    with st.chat_message("assistant", avatar="💗"):
+        with st.spinner("Reviewing the current dashboard data..."):
+            result = answer_dashboard_question(question, context)
+        if result:
+            answer, model_used = result
+            st.markdown(
+                f'<div class="cw-ai-response">{answer}</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(f"AI model: {model_used}")
+            st.session_state.catwatch_chat.append(
+                {"role": "assistant", "content": answer, "model": model_used}
+            )
+        else:
+            answer = "No configured AI model returned a usable response."
+            st.warning(answer)
+            if _AI_ERROR.get("msg"):
+                st.caption(f"Last provider error: {_AI_ERROR['msg']}")
+            st.session_state.catwatch_chat.append({"role": "assistant", "content": answer})
 
 
 def storm_facts(s):
@@ -1336,9 +1549,7 @@ def render_event_card(event):
 
 def render_tc_card(s, ai_on=False):
     fo = s.get("outlook")
-    ai_result = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
-    ai_text, ai_model_used = ai_result if ai_result else (None, None)
-    brief = ai_text or fallback_brief(s)
+    brief = fallback_brief(s)
     r, g, b = tc_color(s.get("vmax"), s.get("invest"))
 
     chips = [
@@ -1354,11 +1565,7 @@ def render_tc_card(s, ai_on=False):
     with st.container(border=True):
         st.markdown(" ".join(chips), unsafe_allow_html=True)
         st.markdown(f"### {s['name']}")
-        if ai_text:
-            st.markdown(f":violet[**{brief}**]")
-            st.caption(f"AI model: {ai_model_used}")
-        else:
-            st.markdown(f"**{brief}**")
+        st.markdown(f"**{brief}**")
         st.caption(f"Winds {s['vmax']:.0f} kt · Pressure {pressure} · Moving {s['move']}")
         st.caption(f"{s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}")
         if s.get("url"):
@@ -1467,6 +1674,7 @@ def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest
     render_static_legend(include_tc="Tropical Cyclone" in selected, include_perils=True, perils=selected)
     marker_style = select_marker_style("overview_marker_style")
     render_world_map(filtered_events, tropical_systems=filtered_tcs, height=570, show_tracks=True, key="overview_map", marker_style=marker_style)
+    render_mission_control_chat(tropical_systems, current_other_events)
 
 
 def render_hurricane_watch(tropical_systems, jtwc_loading):
@@ -1479,16 +1687,14 @@ def render_hurricane_watch(tropical_systems, jtwc_loading):
     render_world_map([tc_to_map_event(s) for s in tropical_systems], tropical_systems=tropical_systems, height=540, show_tracks=True, key="tc_map")
     storms = [s for s in tropical_systems if not s["invest"]]
     invests = [s for s in tropical_systems if s["invest"]]
-    ai_on = ai_available()
     hdr = f"{len(storms)} storm{'s' if len(storms) != 1 else ''}"
     if invests:
         hdr += f" · {len(invests)} area{'s' if len(invests) != 1 else ''} of interest"
     st.subheader(f"Currently monitoring — {hdr}")
-    st.caption("🧠 AI briefs on" if ai_on else "AI briefs off — add at least one supported API key to .streamlit/secrets.toml.")
     cols = st.columns(3)
     for i, s in enumerate(storms):
         with cols[i % 3]:
-            render_tc_card(s, ai_on=ai_on)
+            render_tc_card(s)
     st.markdown("---")
     st.subheader(f"Formation outlook — {len(invests)} area{'s' if len(invests) != 1 else ''} of interest")
     if not invests:
