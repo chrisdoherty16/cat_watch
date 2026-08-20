@@ -127,7 +127,7 @@ TC_PALETTE = {
     "Invest": [150, 160, 175],
 }
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🌍", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="☄️", layout="wide")
 
 st.markdown(
     """
@@ -1128,7 +1128,7 @@ def render_static_legend(include_tc=True, include_perils=True, perils=None):
         st.markdown(" ".join(bits), unsafe_allow_html=True)
 
 
-def select_map_layers(available_perils, key, label="Map layers"):
+def select_map_layers(available_perils, key, label="Mapped Perils"):
     ordered = [p for p in PERIL_ORDER if p in available_perils]
     if not ordered:
         return []
@@ -1150,9 +1150,9 @@ def select_gdacs_alert_levels(events, key):
     display = [labels[x] for x in available]
     label_to_alert = {labels[x]: x for x in available}
     if hasattr(st, "pills"):
-        chosen = st.pills("GDACS alert", display, selection_mode="multi", default=display, key=key)
+        chosen = st.pills("GDACS Severity Alert", display, selection_mode="multi", default=display, key=key)
     else:
-        chosen = st.multiselect("GDACS alert", display, default=display, key=key)
+        chosen = st.multiselect("GDACS Severity Alert", display, default=display, key=key)
     return [label_to_alert[x] for x in chosen]
 
 def filter_events_by_peril(events, selected_perils):
@@ -1279,7 +1279,7 @@ def render_monitoring_summary(map_events):
     crit = sum(1 for e in map_events if e.get("severity") == "Critical")
     watch = sum(1 for e in map_events if e.get("severity") == "Watch")
     perils = sorted({e.get("peril", "Other") for e in map_events})
-    st.markdown(f"**Monitoring {total} current event{'s' if total != 1 else ''} across {len(perils)} peril layer{'s' if len(perils) != 1 else ''}.** Critical: **{crit}** · Watch: **{watch}**")
+    st.markdown(f"**Monitoring {total} current event{'s' if total != 1 else ''} across {len(perils)} peril{'s' if len(perils) != 1 else ''}.** Critical: **{crit}** · Watch: **{watch}**")
 
 
 def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading):
@@ -1593,8 +1593,8 @@ def render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unre
 
 
 def app():
-    st.title("🌍 CatWatch")
-    st.caption("Morning global catastrophe monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS and CAL FIRE")
+    st.title("☄️ CatWatch ☄️")
+    st.caption("Global Catastrophe Monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS and CAL FIRE")
     tropical_systems, jtwc_loading = get_tropical_systems()
     gdacs_events = load_gdacs_events()
     calfire_events = load_calfire_events()
@@ -1604,7 +1604,7 @@ def app():
     earthquake_events = [e for e in gdacs_events if e.get("peril") == "Earthquake"]
     flood_events = [e for e in gdacs_events if e.get("peril") == "Flood"]
     drought_events = [e for e in gdacs_events if e.get("peril") == "Drought"]
-    tabs = st.tabs(["Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Data"])
+    tabs = st.tabs(["Mission Control - Global Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Data"])
     with tabs[0]:
         render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading)
     with tabs[1]:
