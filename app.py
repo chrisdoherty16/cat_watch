@@ -69,6 +69,14 @@ GEMINI_MODELS = [
     "gemini-2.5-flash",
 ]
 
+# Optional zero-cost model providers. Each provider is used only when its key
+# exists in Streamlit secrets. The chain stops after the first valid response.
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b"
+LLAMA_CHAT_URL = "https://api.llama.com/compat/v1/chat/completions"
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_FREE_MODEL = "openrouter/free"
+
 PERIL_ORDER = [
     "Tropical Cyclone",
     "Earthquake",
@@ -435,7 +443,11 @@ def _formation_prob(s):
         if isinstance(v, str) and v not in ("", "N/A"):
             risk = v
             break
-    return {"p2": num("prob_2day"), "p7": num("prob_7day", "prob_5day"), "risk": risk}
+    return {
+        "p2": num("prob_2day", "prob_2_day", "two_day_prob", "formation_prob_2day", "formation_prob_48h"),
+        "p7": num("prob_7day", "prob_7_day", "seven_day_prob", "prob_5day", "formation_prob_7day"),
+        "risk": risk,
+    }
 
 
 def _read_tropycal(rt, want_cone, source="NHC"):
@@ -566,16 +578,75 @@ def get_tropical_systems():
     out.sort(key=lambda s: (s["invest"], -s["vmax"]))
     return out, loading
 
+
+@st.fragment(run_every="3s")
+def monitor_jtwc_completion():
+    """Refresh the full app once when the background JTWC read completes."""
+    if jtwc_state()["data"] is not None:
+        st.rerun()
+
 # ---------------------------------------------------------------------------
 # Optional Gemini brief for tropical cyclones
 # ---------------------------------------------------------------------------
 
 
-def gemini_key():
+def secret_value(name, default=""):
     try:
-        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        return str(st.secrets.get(name, default)).strip()
     except Exception:
-        return ""
+        return str(default).strip()
+
+
+def ai_available():
+    return bool(
+        secret_value("GEMINI_API_KEY")
+        or secret_value("GROQ_API_KEY")
+        or (secret_value("LLAMA_API_KEY") and secret_value("LLAMA_MODEL"))
+        or secret_value("OPENROUTER_API_KEY")
+    )
+
+
+def valid_ai_text(text):
+    text = str(text or "").strip()
+    if len(text) < 25 or len(text) > 700:
+        return None
+    lowered = text.lower()
+    if any(token in lowered for token in ("error:", "unable to comply", "i cannot access")):
+        return None
+    return text
+
+
+def openai_compatible_brief(url, api_key, model, prompt, provider_label):
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 120,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        text = valid_ai_text(content)
+        if not text:
+            return None
+        actual_model = str(payload.get("model") or model).strip()
+        return text, f"{provider_label} · {actual_model}"
+    except Exception as exc:
+        _AI_ERROR["msg"] = f"{provider_label}: {type(exc).__name__}: {str(exc)[:180]}"
+        return None
+
+
+def gemini_key():
+    return secret_value("GEMINI_API_KEY")
 
 
 @st.cache_resource(show_spinner=False)
@@ -641,36 +712,82 @@ def fallback_brief(s):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def ai_brief(facts, discussion=None):
-    client, model = gemini_client(), gemini_model()
-    if client is None or not model:
-        return None
     if discussion:
         prompt = (
-            "You are briefing a reinsurance underwriter. Read this official NHC forecast "
-            "discussion and give ONE concise, plain sentence capturing what the storm is "
+            "You are briefing a catastrophe-monitoring user. Read this official tropical-cyclone "
+            "forecast discussion and give ONE concise, plain sentence capturing what the storm is "
             "doing now and the key forecast threat. No preamble, no lists.\n\nDISCUSSION:\n"
             + discussion[:6000]
         )
     else:
         prompt = (
-            "You are briefing a reinsurance underwriter. In ONE concise, plain sentence, "
+            "You are briefing a catastrophe-monitoring user. In ONE concise, plain sentence, "
             "state what this tropical system is doing now and its key forecast. No preamble, no lists.\nFacts: "
             + facts
         )
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-            ),
-        )
-        text = (resp.text or "").strip()
-        return text or None
-    except Exception as e:
-        _AI_ERROR["msg"] = f"{type(e).__name__}: {str(e)[:200]}"
-        return None
 
+    # 1. Gemini Flash
+    client, model = gemini_client(), gemini_model()
+    if client is not None and model:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=120,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            text = valid_ai_text(response.text)
+            if text:
+                return text, f"Google · {model}"
+        except Exception as exc:
+            _AI_ERROR["msg"] = f"Google: {type(exc).__name__}: {str(exc)[:180]}"
+
+    # 2. Groq. The model can be changed from secrets without editing app.py.
+    groq_key = secret_value("GROQ_API_KEY")
+    if groq_key:
+        result = openai_compatible_brief(
+            GROQ_CHAT_URL,
+            groq_key,
+            secret_value("GROQ_MODEL", GROQ_DEFAULT_MODEL),
+            prompt,
+            "Groq",
+        )
+        if result:
+            return result
+
+    # 3. Official Meta Llama API. LLAMA_MODEL is required because access and
+    # available model IDs depend on the account's current preview entitlement.
+    llama_key = secret_value("LLAMA_API_KEY")
+    llama_model = secret_value("LLAMA_MODEL")
+    if llama_key and llama_model:
+        result = openai_compatible_brief(
+            LLAMA_CHAT_URL,
+            llama_key,
+            llama_model,
+            prompt,
+            "Meta Llama",
+        )
+        if result:
+            return result
+
+    # 4. OpenRouter's free router chooses an available zero-cost model and
+    # returns the actual model ID, which is shown on the storm card.
+    openrouter_key = secret_value("OPENROUTER_API_KEY")
+    if openrouter_key:
+        result = openai_compatible_brief(
+            OPENROUTER_CHAT_URL,
+            openrouter_key,
+            OPENROUTER_FREE_MODEL,
+            prompt,
+            "OpenRouter",
+        )
+        if result:
+            return result
+
+    return None
 # ---------------------------------------------------------------------------
 # GDACS + CAL FIRE - non-tropical-cyclone global perils
 # ---------------------------------------------------------------------------
@@ -1219,7 +1336,8 @@ def render_event_card(event):
 
 def render_tc_card(s, ai_on=False):
     fo = s.get("outlook")
-    ai_text = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
+    ai_result = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
+    ai_text, ai_model_used = ai_result if ai_result else (None, None)
     brief = ai_text or fallback_brief(s)
     r, g, b = tc_color(s.get("vmax"), s.get("invest"))
 
@@ -1238,6 +1356,7 @@ def render_tc_card(s, ai_on=False):
         st.markdown(f"### {s['name']}")
         if ai_text:
             st.markdown(f":violet[**{brief}**]")
+            st.caption(f"AI model: {ai_model_used}")
         else:
             st.markdown(f"**{brief}**")
         st.caption(f"Winds {s['vmax']:.0f} kt · Pressure {pressure} · Moving {s['move']}")
@@ -1309,8 +1428,33 @@ def select_marker_style(key):
     return st.radio("Map colors", options, horizontal=True, key=key)
 
 def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading):
-    other_events = gdacs_events + calfire_events + civil_unrest_events
-    all_events = [tc_to_map_event(s) for s in tropical_systems] + other_events
+    now = datetime.now(timezone.utc)
+    default_hours = {
+        "Wildfire": 168,
+        "Earthquake": 168,
+        "Flood": 168,
+        "Drought": 720,
+        "Civil Unrest": 24,
+        "Volcano": 168,
+        "Other": 168,
+    }
+
+    current_other_events = []
+    for event in gdacs_events + calfire_events + civil_unrest_events:
+        # CAL FIRE already supplies the active-incident feed, matching its tab.
+        if event.get("source") == "CAL FIRE":
+            current_other_events.append(event)
+            continue
+        max_age = default_hours.get(event.get("peril"), 168)
+        dt = event.get("updated_utc") or event.get("published_utc")
+        if dt is None or not hasattr(dt, "timestamp"):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.astimezone(timezone.utc) >= now - timedelta(hours=max_age):
+            current_other_events.append(event)
+
+    all_events = [tc_to_map_event(s) for s in tropical_systems] + current_other_events
     if jtwc_loading:
         st.caption("⏳ Loading global JTWC tropical systems in the background...")
     render_monitoring_summary(all_events)
@@ -1335,12 +1479,12 @@ def render_hurricane_watch(tropical_systems, jtwc_loading):
     render_world_map([tc_to_map_event(s) for s in tropical_systems], tropical_systems=tropical_systems, height=540, show_tracks=True, key="tc_map")
     storms = [s for s in tropical_systems if not s["invest"]]
     invests = [s for s in tropical_systems if s["invest"]]
-    ai_on = bool(gemini_key())
+    ai_on = ai_available()
     hdr = f"{len(storms)} storm{'s' if len(storms) != 1 else ''}"
     if invests:
         hdr += f" · {len(invests)} area{'s' if len(invests) != 1 else ''} of interest"
     st.subheader(f"Currently monitoring — {hdr}")
-    st.caption("🧠 AI briefs on" if ai_on else "AI briefs off — add GEMINI_API_KEY to .streamlit/secrets.toml to enable.")
+    st.caption("🧠 AI briefs on" if ai_on else "AI briefs off — add at least one supported API key to .streamlit/secrets.toml.")
     cols = st.columns(3)
     for i, s in enumerate(storms):
         with cols[i % 3]:
@@ -1359,9 +1503,14 @@ def render_hurricane_watch(tropical_systems, jtwc_loading):
                     st.markdown("`Invest`")
                     st.markdown(f"### {s['name']}")
                     st.write(risk + " formation risk" if risk else "Area of interest")
-                    m1, m2 = st.columns(2)
-                    m1.metric("48-hour", f"{p2}%" if p2 is not None else "—")
-                    m2.metric("7-day", f"{p7}%" if p7 is not None else "—")
+                    if p2 is not None or p7 is not None:
+                        m1, m2 = st.columns(2)
+                        m1.metric("48-hour", f"{p2}%" if p2 is not None else "Not issued")
+                        m2.metric("7-day", f"{p7}%" if p7 is not None else "Not issued")
+                    elif s.get("source") == "JTWC":
+                        st.caption("JTWC invest feed does not provide NHC-style 48-hour and 7-day formation percentages.")
+                    else:
+                        st.caption("Formation percentages are not available in the current source record.")
                     st.caption(f"{s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}")
 
 
@@ -1640,6 +1789,8 @@ def app():
     st.title("☄️ CatWatch ☄️")
     st.caption("Global Catastrophe Monitor · Hurricanes from NHC/JTWC via Tropycal · Other perils from GDACS and CAL FIRE")
     tropical_systems, jtwc_loading = get_tropical_systems()
+    if jtwc_loading:
+        monitor_jtwc_completion()
     gdacs_events = load_gdacs_events()
     calfire_events = load_calfire_events()
     civil_unrest_events = []  # GDELT disabled to avoid blocking app startup
