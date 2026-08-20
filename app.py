@@ -1016,7 +1016,7 @@ def tc_to_map_event(s):
     }
 
 
-def build_map_layers(events, tropical_systems, show_tracks=True):
+def build_map_layers(events, tropical_systems, show_tracks=True, marker_style="Severity colors"):
     obs_paths, fc_paths, cones, dots = [], [], [], []
 
     if show_tracks:
@@ -1033,15 +1033,24 @@ def build_map_layers(events, tropical_systems, show_tracks=True):
         lat, lon = to_float(e.get("lat")), to_float(e.get("lon"))
         if lat is None or lon is None:
             continue
+        peril = e.get("peril", "Other")
         sev = e.get("severity", "Info")
         radius = {"Critical": 85000, "Watch": 70000, "Advisory": 56000, "Info": 44000}.get(sev, 44000)
+
+        # Severity mode retains GDACS alert colors and CAL FIRE acreage bands.
+        # Peril mode intentionally matches the existing legend palette.
+        if marker_style == "Peril colors" and peril != "Tropical Cyclone":
+            color = PERIL_META.get(peril, PERIL_META["Other"])["color"]
+        else:
+            color = e.get("color") or PERIL_META.get(peril, PERIL_META["Other"])["color"]
+
         hover = hover_fields_for_event(e)
         dots.append({
             "position": [lon, lat],
-            "color": e.get("color") or PERIL_META.get(e.get("peril"), PERIL_META["Other"])["color"],
+            "color": color,
             "radius": radius,
             "title": e.get("title", "Untitled event"),
-            "peril": e.get("peril", "Other"),
+            "peril": peril,
             "source": e.get("source", ""),
             "severity": sev,
             "metric": e.get("metric_text", ""),
@@ -1079,10 +1088,9 @@ def build_map_layers(events, tropical_systems, show_tracks=True):
     ]
     return layers
 
-
-def render_world_map(events, tropical_systems=None, height=560, show_tracks=True, key="map"):
+def render_world_map(events, tropical_systems=None, height=560, show_tracks=True, key="map", marker_style="Severity colors"):
     tropical_systems = tropical_systems or []
-    layers = build_map_layers(events, tropical_systems, show_tracks=show_tracks)
+    layers = build_map_layers(events, tropical_systems, show_tracks=show_tracks, marker_style=marker_style)
     st.pydeck_chart(
         pdk.Deck(
             map_provider="carto",
@@ -1104,8 +1112,8 @@ def render_world_map(events, tropical_systems=None, height=560, show_tracks=True
         ),
         height=height,
         width="stretch",
+        key=key,
     )
-
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -1282,6 +1290,12 @@ def render_monitoring_summary(map_events):
     st.markdown(f"**Monitoring {total} current event{'s' if total != 1 else ''} across {len(perils)} peril{'s' if len(perils) != 1 else ''}.** Critical: **{crit}** · Watch: **{watch}**")
 
 
+def select_marker_style(key):
+    options = ["Severity colors", "Peril colors"]
+    if hasattr(st, "segmented_control"):
+        return st.segmented_control("Map colors", options, default=options[0], key=key)
+    return st.radio("Map colors", options, horizontal=True, key=key)
+
 def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading):
     other_events = gdacs_events + calfire_events + civil_unrest_events
     all_events = [tc_to_map_event(s) for s in tropical_systems] + other_events
@@ -1295,7 +1309,8 @@ def render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest
     filtered_events = filter_events_by_gdacs_alert(filtered_events, gdacs_alerts)
     filtered_tcs = tropical_systems if "Tropical Cyclone" in selected else []
     render_static_legend(include_tc="Tropical Cyclone" in selected, include_perils=True, perils=selected)
-    render_world_map(filtered_events, tropical_systems=filtered_tcs, height=570, show_tracks=True, key="overview_map")
+    marker_style = select_marker_style("overview_marker_style")
+    render_world_map(filtered_events, tropical_systems=filtered_tcs, height=570, show_tracks=True, key="overview_map", marker_style=marker_style)
 
 
 def render_hurricane_watch(tropical_systems, jtwc_loading):
@@ -1562,7 +1577,7 @@ def render_peril_tab(title, events, caption=None, icon=None):
     else:
         render_non_hurricane_summary(filtered)
     render_static_legend(include_tc=False, include_perils=True, perils=selected)
-    render_world_map(filtered, tropical_systems=[], height=500, show_tracks=False, key=f"{title}_map")
+    render_world_map(filtered, tropical_systems=[], height=500, show_tracks=False, key=f"{title}_map", marker_style="Severity colors")
     st.subheader(f"{icon or ''} {title} — {len(filtered)}")
     cols = st.columns(2)
     for i, event in enumerate(filtered[:60]):
