@@ -26,7 +26,6 @@ import pandas as pd
 import pydeck as pdk
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from tropycal import realtime
@@ -45,8 +44,10 @@ except Exception:
 # Optional AI layer. Absent library or key -> app runs unchanged.
 try:
     from google import genai
+    from google.genai import types
 except Exception:
     genai = None
+    types = None
 
 # ---------------------------------------------------------------------------
 # Page config + constants
@@ -649,7 +650,13 @@ def ai_brief(facts, discussion=None):
             + facts
         )
     try:
-        resp = client.models.generate_content(model=model, contents=prompt)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+            ),
+        )
         text = (resp.text or "").strip()
         return text or None
     except Exception as e:
@@ -1096,7 +1103,7 @@ def render_world_map(events, tropical_systems=None, height=560, show_tracks=True
             },
         ),
         height=height,
-        use_container_width=True,
+        width="stretch",
     )
 
 # ---------------------------------------------------------------------------
@@ -1192,8 +1199,8 @@ def render_event_card(event):
 
 def render_tc_card(s, ai_on=False):
     fo = s.get("outlook")
-    brief = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
-    brief = brief or fallback_brief(s)
+    ai_text = ai_brief(storm_facts(s), s.get("discussion")) if ai_on and not s.get("invest") else None
+    brief = ai_text or fallback_brief(s)
     r, g, b = tc_color(s.get("vmax"), s.get("invest"))
 
     chips = [
@@ -1209,7 +1216,10 @@ def render_tc_card(s, ai_on=False):
     with st.container(border=True):
         st.markdown(" ".join(chips), unsafe_allow_html=True)
         st.markdown(f"### {s['name']}")
-        st.markdown(f":violet[**{brief}**]")
+        if ai_text:
+            st.markdown(f":violet[**{brief}**]")
+        else:
+            st.markdown(f"**{brief}**")
         st.caption(f"Winds {s['vmax']:.0f} kt · Pressure {pressure} · Moving {s['move']}")
         st.caption(f"{s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}")
         if s.get("url"):
@@ -1579,7 +1589,7 @@ def render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unre
             df[col] = None
     df["severity_rank"] = df["severity"].map(SEVERITY_ORDER).fillna(9)
     df = df.sort_values(["severity_rank", "peril", "source", "title"]).drop(columns=["severity_rank"])
-    st.dataframe(df[keep], use_container_width=True, hide_index=True, column_config={"url": st.column_config.LinkColumn("Source")})
+    st.dataframe(df[keep], width="stretch", hide_index=True, column_config={"url": st.column_config.LinkColumn("Source")})
 
 
 def app():
@@ -1613,10 +1623,6 @@ def app():
         render_civil_unrest_tab(civil_unrest_events)
     with tabs[8]:
         render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events)
-    components.html("""<script>setTimeout(function(){ window.parent.location.reload(); }, 15 * 60 * 1000);</script>""", height=0)
-    if jtwc_loading:
-        time.sleep(4)
-        st.rerun()
 
 
 if __name__ == "__main__":
