@@ -1354,6 +1354,25 @@ def tc_to_map_event(s):
     }
 
 
+def unwrap_path(points):
+    """Make a lon/lat path continuous across the antimeridian (Date Line) so
+    deck.gl doesn't draw a line all the way across the map. Each point's
+    longitude is shifted by +/-360 so consecutive points never jump >180 deg.
+    The map basemap repeats east-west, so drawing past +/-180 renders correctly."""
+    if not points:
+        return points
+    out = [[float(points[0][0]), float(points[0][1])]]
+    for p in points[1:]:
+        lon, lat = float(p[0]), float(p[1])
+        prev = out[-1][0]
+        while lon - prev > 180:
+            lon -= 360
+        while lon - prev < -180:
+            lon += 360
+        out.append([lon, lat])
+    return out
+
+
 def build_map_layers(events, tropical_systems, show_tracks=True, marker_style="Severity colors"):
     obs_paths, fc_paths, cones, dots = [], [], [], []
 
@@ -1361,11 +1380,11 @@ def build_map_layers(events, tropical_systems, show_tracks=True, marker_style="S
         for s in tropical_systems:
             col = tc_color(s.get("vmax"), s.get("invest"))
             if len(s.get("track", [])) >= 2:
-                obs_paths.append({"path": s["track"], "color": col})
+                obs_paths.append({"path": unwrap_path(s["track"]), "color": col})
             if len(s.get("fc_track", [])) >= 2:
-                fc_paths.append({"path": s["fc_track"], "color": [255, 255, 255]})
+                fc_paths.append({"path": unwrap_path(s["fc_track"]), "color": [255, 255, 255]})
             if s.get("cone"):
-                cones.append({"polygon": s["cone"]})
+                cones.append({"polygon": unwrap_path(s["cone"])})
 
     for e in events:
         lat, lon = to_float(e.get("lat")), to_float(e.get("lon"))
