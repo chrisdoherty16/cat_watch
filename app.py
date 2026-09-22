@@ -21,6 +21,7 @@ import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
 from html import unescape
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -60,6 +61,12 @@ GDACS_RSS_URL = "https://www.gdacs.org/XML/RSS.xml"
 CALFIRE_URL = "https://incidents.fire.ca.gov/umbraco/api/IncidentApi/List?inactive=false"
 GDELT_EXPORT_BASE = "https://data.gdeltproject.org/gdeltv2"
 _GDELT_DIAG = {"files_attempted": 0, "files_loaded": 0, "raw_rows": 0, "unrest_rows": 0, "final_events": 0}
+
+# Custom Feed - user-defined exact-phrase news monitor via Google News RSS.
+GOOGLE_NEWS_RSS_BASE = "https://news.google.com/rss/search"
+CUSTOM_FEED_MAX_PHRASES = 10
+CUSTOM_FEED_MAX_AGE_HOURS = 48
+CUSTOM_FEED_PER_PHRASE_CAP = 20
 
 # Preferred Flash models, best first. We pick whichever your key can access.
 GEMINI_MODELS = [
@@ -1331,6 +1338,106 @@ def load_civil_unrest_events(hours=48, max_files=192, max_events=150):
     diag["final_events"] = int(len(events))
     _GDELT_DIAG.update(diag)
     return events
+
+# ---------------------------------------------------------------------------
+# Custom Feed - user-defined exact-phrase news monitor (Google News RSS)
+# ---------------------------------------------------------------------------
+
+
+def google_news_rss_url(phrase):
+    query = quote_plus(f'"{phrase}"')
+    return f"{GOOGLE_NEWS_RSS_BASE}?q={query}&hl=en-US&gl=US&ceid=US:en"
+
+
+def split_google_news_title(raw_title):
+    """Google News titles are usually 'Headline - Publisher'. Split them so the
+    publisher can be shown as the source instead of buried in the headline."""
+    raw_title = (raw_title or "").strip()
+    if " - " in raw_title:
+        main, _, publisher = raw_title.rpartition(" - ")
+        if main.strip() and publisher.strip():
+            return main.strip(), publisher.strip()
+    return raw_title, ""
+
+
+def _entry_source_title(entry):
+    src = entry.get("source")
+    if isinstance(src, dict):
+        return str(src.get("title") or src.get("value") or "").strip()
+    title = getattr(src, "title", None)
+    if title:
+        return str(title).strip()
+    return ""
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_google_news_for_phrase(phrase, max_items=CUSTOM_FEED_PER_PHRASE_CAP):
+    """Fetch and normalize Google News RSS results for a single exact phrase.
+    Cached per-phrase so editing one phrase doesn't refetch every phrase."""
+    if feedparser is None or not phrase:
+        return []
+    url = google_news_rss_url(phrase)
+    try:
+        parsed = feedparser.parse(url, request_headers=REQUEST_HEADERS)
+    except Exception:
+        return []
+
+    events = []
+    for entry in parsed.entries[:max_items]:
+        raw_title = clean_html(entry.get("title", ""))
+        headline, publisher = split_google_news_title(raw_title)
+        source_title = _entry_source_title(entry) or publisher or "Google News"
+        summary = clean_html(entry.get("summary", entry.get("description", "")))
+        link = entry.get("link", "")
+        published = parse_entry_dt(entry)
+        events.append({
+            "event_id": f"NEWS|{link or headline}",
+            "source": source_title,
+            "peril": "Custom Feed",
+            "title": headline or raw_title or "Untitled article",
+            "summary": summary,
+            "severity": "Info",
+            "alert_level": "Unknown",
+            "lat": None,
+            "lon": None,
+            "published_utc": published,
+            "updated_utc": published,
+            "time": fmt_bermuda(published) if published else "—",
+            "age": age_label(published) if published else "Unknown age",
+            "url": link,
+            "metric_text": "",
+            "color": PERIL_META["Other"]["color"],
+        })
+    return events
+
+
+def load_custom_feed_events(phrases, max_age_hours=CUSTOM_FEED_MAX_AGE_HOURS, per_phrase_cap=CUSTOM_FEED_PER_PHRASE_CAP):
+    """Fetch each phrase's cached results, restrict to the recency window, and
+    dedupe articles that match more than one phrase (tagging all matches)."""
+    if not phrases:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    merged = {}
+    for phrase in phrases:
+        for item in fetch_google_news_for_phrase(phrase, per_phrase_cap):
+            dt = item.get("published_utc")
+            # Recency is a hard requirement for this tab, so undated items are
+            # dropped rather than guessed at.
+            if dt is None or dt < cutoff:
+                continue
+            key = item.get("url") or item.get("title")
+            if key in merged:
+                if phrase not in merged[key]["matched_phrases"]:
+                    merged[key]["matched_phrases"].append(phrase)
+            else:
+                new_item = dict(item)
+                new_item["matched_phrases"] = [phrase]
+                merged[key] = new_item
+
+    events = list(merged.values())
+    events.sort(key=lambda e: -(e["published_utc"].timestamp() if e.get("published_utc") else 0))
+    return events
+
 # ---------------------------------------------------------------------------
 # Normalized map records
 # ---------------------------------------------------------------------------
@@ -1794,7 +1901,12 @@ def recency_filter_widget(title):
         "Last 30 days": 720,
         "All active/current feed": None,
     }
-    default_label = "Last 30 days" if title == "Drought" else ("All active/current feed" if title == "CA Wildfire" else "Last 7 days")
+    defaults = {
+        "CA Wildfire": "All active/current feed",
+        "Drought": "Last 30 days",
+        "Civil Unrest": "Last 24 hours",
+    }
+    default_label = defaults.get(title, "Last 7 days")
     label = st.selectbox(
         "Recency",
         list(options.keys()),
@@ -1816,76 +1928,6 @@ def render_gemini_diagnostics():
                 st.caption(f"Last Gemini error: {_AI_ERROR['msg']}")
         else:
             st.caption("For local runs, create .streamlit/secrets.toml. For Streamlit Cloud, set the secret in the app settings. Do not commit secrets.toml.")
-
-
-
-def event_timestamp(event):
-    dt = event.get("updated_utc") or event.get("published_utc")
-    if dt is None or not hasattr(dt, "timestamp"):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def filter_events_by_recency(events, max_age_hours=None):
-    if max_age_hours is None:
-        return list(events)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-    out = []
-    for event in events:
-        dt = event_timestamp(event)
-        if dt is None or dt >= cutoff:
-            out.append(event)
-    return out
-
-
-def sort_events_for_live_view(events):
-    def sort_key(event):
-        dt = event_timestamp(event)
-        timestamp = dt.timestamp() if dt else 0
-        return (severity_rank(event.get("severity")), -timestamp, ALERT_ORDER.get(event.get("alert_level"), 9), event.get("title", ""))
-    return sorted(events, key=sort_key)
-
-
-def render_non_hurricane_summary(events, source_hint=None):
-    total = len(events)
-    counts = {level: sum(1 for e in events if e.get("severity") == level) for level in ["Critical", "Watch", "Advisory", "Info"]}
-    st.markdown(
-        f"**{total} current event{'s' if total != 1 else ''}.** "
-        f"Critical: **{counts['Critical']}** · Watch: **{counts['Watch']}** · "
-        f"Advisory: **{counts['Advisory']}** · Info: **{counts['Info']}**"
-    )
-    gdacs = [e for e in events if e.get("source") == "GDACS"]
-    if gdacs:
-        alerts = {level: sum(1 for e in gdacs if e.get("alert_level") == level) for level in ["Red", "Orange", "Green"]}
-        st.caption(f"GDACS alerts: Red {alerts['Red']} · Orange {alerts['Orange']} · Green {alerts['Green']}")
-    elif source_hint:
-        st.caption(source_hint)
-
-
-def recency_filter_widget(title):
-    options = {
-        "Last 24 hours": 24,
-        "Last 3 days": 72,
-        "Last 7 days": 168,
-        "Last 14 days": 336,
-        "Last 30 days": 720,
-        "All active/current feed": None,
-    }
-    defaults = {
-        "CA Wildfire": "All active/current feed",
-        "Drought": "Last 30 days",
-        "Civil Unrest": "Last 24 hours",
-    }
-    default_label = defaults.get(title, "Last 7 days")
-    label = st.selectbox(
-        "Recency",
-        list(options.keys()),
-        index=list(options.keys()).index(default_label),
-        key=f"{title.lower().replace(' ', '_')}_recency",
-    )
-    return options[label]
 
 
 def render_gdelt_diagnostics(events=None):
@@ -1990,6 +2032,75 @@ def render_peril_tab(title, events, caption=None, icon=None):
 def render_civil_unrest_tab(civil_unrest_events):
     st.info("Civil unrest monitoring is temporarily disabled while the source is being reworked.")
 
+
+def render_custom_feed_card(event):
+    title = event.get("title") or "Untitled article"
+    url = event.get("url") or ""
+    summary = display_summary(event.get("summary", ""), max_len=360)
+    source = event.get("source", "Google News")
+    phrases = event.get("matched_phrases", [])
+    subline = " · ".join(x for x in [event.get("time", "—"), event.get("age", "")] if x)
+
+    with st.container(border=True):
+        st.markdown(f"**📰 {source}**")
+        st.markdown(f"### {title}")
+        if phrases:
+            chips = " ".join(f'<span class="cw-chip">{p}</span>' for p in phrases)
+            st.markdown(chips, unsafe_allow_html=True)
+        st.caption(subline)
+        if summary:
+            st.write(summary)
+        if url:
+            st.markdown(f"[Open source ↗]({url})")
+
+
+def render_custom_feed_tab():
+    st.caption(
+        f"Weather-focused news monitor. Enter up to {CUSTOM_FEED_MAX_PHRASES} exact phrases, one per line "
+        f"(e.g. \"hurricane polo\", \"mexico hurricane\", \"mexican hurricane insured loss\"). Each phrase is "
+        f"matched exactly via Google News, and results are restricted to the last {CUSTOM_FEED_MAX_AGE_HOURS} hours."
+    )
+
+    text = st.text_area(
+        f"Phrases to monitor (one per line, max {CUSTOM_FEED_MAX_PHRASES})",
+        value=st.session_state.get("custom_feed_input", ""),
+        height=160,
+        key="custom_feed_input",
+        placeholder="hurricane polo\nmexico hurricane\nmexican hurricane insured loss",
+    )
+
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    phrases = raw_lines[:CUSTOM_FEED_MAX_PHRASES]
+    if len(raw_lines) > CUSTOM_FEED_MAX_PHRASES:
+        st.warning(
+            f"Only the first {CUSTOM_FEED_MAX_PHRASES} phrases are used; "
+            f"{len(raw_lines) - CUSTOM_FEED_MAX_PHRASES} additional line(s) were ignored."
+        )
+
+    if not phrases:
+        st.info("Add at least one phrase above to start monitoring news.")
+        return
+
+    if st.button("🔄 Refresh now", key="custom_feed_refresh"):
+        fetch_google_news_for_phrase.clear()
+
+    with st.spinner("Scanning Google News for your phrases..."):
+        events = load_custom_feed_events(phrases)
+
+    phrase_chips = " ".join(f'<span class="cw-chip">{p}</span>' for p in phrases)
+    st.markdown(phrase_chips, unsafe_allow_html=True)
+    st.markdown(
+        f"**{len(events)} article{'s' if len(events) != 1 else ''}** found across "
+        f"**{len(phrases)} phrase{'s' if len(phrases) != 1 else ''}** in the last {CUSTOM_FEED_MAX_AGE_HOURS} hours."
+    )
+
+    if not events:
+        st.info("No matching articles in the last 48 hours. Try broader phrasing, or check back later.")
+        return
+
+    for event in events[:100]:
+        render_custom_feed_card(event)
+
 def render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events):
     rows = []
     for s in tropical_systems:
@@ -2024,7 +2135,7 @@ def app():
     earthquake_events = [e for e in gdacs_events if e.get("peril") == "Earthquake"]
     flood_events = [e for e in gdacs_events if e.get("peril") == "Flood"]
     drought_events = [e for e in gdacs_events if e.get("peril") == "Drought"]
-    tabs = st.tabs(["Mission Control - Global Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Data"])
+    tabs = st.tabs(["Mission Control - Global Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Custom Feed", "Data"])
     with tabs[0]:
         render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading)
     with tabs[1]:
@@ -2042,6 +2153,8 @@ def app():
     with tabs[7]:
         render_civil_unrest_tab(civil_unrest_events)
     with tabs[8]:
+        render_custom_feed_tab()
+    with tabs[9]:
         render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events)
 
 
