@@ -2057,7 +2057,7 @@ def render_custom_feed_card(event):
 def render_custom_feed_tab():
     st.caption(
         f"Weather-focused news monitor. Enter up to {CUSTOM_FEED_MAX_PHRASES} exact phrases, one per line "
-        f"(e.g. \"hurricane polo\", \"mexico hurricane\", \"mexican hurricane insured loss\"). Each phrase is "
+        f"(e.g. \"hurricane polo\", \"hawaii hurricane\", \"nepal earthquake\"). Each phrase is "
         f"matched exactly via Google News, and results are restricted to the last {CUSTOM_FEED_MAX_AGE_HOURS} hours."
     )
 
@@ -2135,7 +2135,7 @@ def app():
     earthquake_events = [e for e in gdacs_events if e.get("peril") == "Earthquake"]
     flood_events = [e for e in gdacs_events if e.get("peril") == "Flood"]
     drought_events = [e for e in gdacs_events if e.get("peril") == "Drought"]
-    tabs = st.tabs(["Mission Control - Global Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Custom Feed", "Data"])
+    tabs = st.tabs(["Mission Control - Global Overview", "Hurricanes", "CA Wildfire", "Global Wildfire", "Earthquake", "Flood", "Drought", "Civil Unrest", "Custom Newsfeed"])
     with tabs[0]:
         render_overview(tropical_systems, gdacs_events, calfire_events, civil_unrest_events, jtwc_loading)
     with tabs[1]:
@@ -2154,8 +2154,6 @@ def app():
         render_civil_unrest_tab(civil_unrest_events)
     with tabs[8]:
         render_custom_feed_tab()
-    with tabs[9]:
-        render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events)
 
 
 if __name__ == "__main__":
