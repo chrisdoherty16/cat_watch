@@ -1903,7 +1903,7 @@ def render_custom_feed_tab():
         value=st.session_state.get("custom_feed_input", ""),
         height=160,
         key="custom_feed_input",
-        placeholder="hurricane polo\nmexico hurricane\nmexican hurricane insured loss",
+        placeholder="type your key phrases here, one per line...",
     )
 
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
