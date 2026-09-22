@@ -15,8 +15,8 @@ Likely dependencies beyond your current hurricane app:
 import io
 import json
 import math
+import os
 import re
-import time
 import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -108,13 +108,6 @@ PERIL_META = {
     "Drought": {"icon": "☀️", "color": [245, 200, 70]},
     "Civil Unrest": {"icon": "⚠️", "color": [35, 205, 190]},
     "Other": {"icon": "📌", "color": [160, 170, 185]},
-}
-
-SEVERITY_COLOR = {
-    "Critical": [230, 25, 75],
-    "Watch": [255, 150, 35],
-    "Advisory": [255, 220, 40],
-    "Info": [150, 160, 175],
 }
 
 GDACS_ALERT_COLOR = {
@@ -601,10 +594,16 @@ def monitor_jtwc_completion():
 
 
 def secret_value(name, default=""):
+    """Read a config value from Streamlit secrets first (local/Community Cloud
+    dev), falling back to OS environment variables (Azure App Service and most
+    other hosts expose configured secrets as env vars, not secrets.toml)."""
     try:
-        return str(st.secrets.get(name, default)).strip()
+        val = st.secrets.get(name, None)
+        if val is not None:
+            return str(val).strip()
     except Exception:
-        return str(default).strip()
+        pass
+    return str(os.environ.get(name, default)).strip()
 
 
 def ai_available():
@@ -901,22 +900,6 @@ def render_mission_control_chat(tropical_systems, current_events):
             st.session_state.catwatch_chat.append({"role": "assistant", "content": answer})
 
 
-def storm_facts(s):
-    bits = [s["name"], s["klass"]]
-    if s.get("vmax"):
-        bits.append(f"{s['vmax']:.0f} kt winds")
-    if s.get("mslp"):
-        bits.append(f"{s['mslp']:.0f} mb")
-    if s.get("move") and s["move"] != "—":
-        bits.append(f"moving {s['move']}")
-    fo = s.get("outlook")
-    if fo:
-        if fo["peak_klass"] != s["klass"] and fo["by"]:
-            bits.append(f"forecast to reach {fo['peak_klass']} by {fo['by']}")
-        bits.append(fo["trend"].split(" ", 1)[-1])
-    return "; ".join(bits)
-
-
 def fallback_brief(s):
     head = f"{s['name']} is a {s['klass'].lower()}"
     if s.get("vmax"):
@@ -930,84 +913,6 @@ def fallback_brief(s):
     return ", ".join(parts) + "."
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def ai_brief(facts, discussion=None):
-    if discussion:
-        prompt = (
-            "You are briefing a catastrophe-monitoring user. Read this official tropical-cyclone "
-            "forecast discussion and give ONE concise, plain sentence capturing what the storm is "
-            "doing now and the key forecast threat. No preamble, no lists.\n\nDISCUSSION:\n"
-            + discussion[:6000]
-        )
-    else:
-        prompt = (
-            "You are briefing a catastrophe-monitoring user. In ONE concise, plain sentence, "
-            "state what this tropical system is doing now and its key forecast. No preamble, no lists.\nFacts: "
-            + facts
-        )
-
-    # 1. Gemini Flash
-    client, model = gemini_client(), gemini_model()
-    if client is not None and model:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=120,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-            text = valid_ai_text(response.text)
-            if text:
-                return text, f"Google · {model}"
-        except Exception as exc:
-            _AI_ERROR["msg"] = f"Google: {type(exc).__name__}: {str(exc)[:180]}"
-
-    # 2. Groq. The model can be changed from secrets without editing app.py.
-    groq_key = secret_value("GROQ_API_KEY")
-    if groq_key:
-        result = openai_compatible_brief(
-            GROQ_CHAT_URL,
-            groq_key,
-            secret_value("GROQ_MODEL", GROQ_DEFAULT_MODEL),
-            prompt,
-            "Groq",
-        )
-        if result:
-            return result
-
-    # 3. Official Meta Llama API. LLAMA_MODEL is required because access and
-    # available model IDs depend on the account's current preview entitlement.
-    llama_key = secret_value("LLAMA_API_KEY")
-    llama_model = secret_value("LLAMA_MODEL")
-    if llama_key and llama_model:
-        result = openai_compatible_brief(
-            LLAMA_CHAT_URL,
-            llama_key,
-            llama_model,
-            prompt,
-            "Meta Llama",
-        )
-        if result:
-            return result
-
-    # 4. OpenRouter's free router chooses an available zero-cost model and
-    # returns the actual model ID, which is shown on the storm card.
-    openrouter_key = secret_value("OPENROUTER_API_KEY")
-    if openrouter_key:
-        result = openai_compatible_brief(
-            OPENROUTER_CHAT_URL,
-            openrouter_key,
-            OPENROUTER_FREE_MODEL,
-            prompt,
-            "OpenRouter",
-        )
-        if result:
-            return result
-
-    return None
 # ---------------------------------------------------------------------------
 # GDACS + CAL FIRE - non-tropical-cyclone global perils
 # ---------------------------------------------------------------------------
@@ -1673,7 +1578,7 @@ def render_event_card(event):
         if url:
             st.markdown(f"[Open source ↗]({url})")
 
-def render_tc_card(s, ai_on=False):
+def render_tc_card(s):
     fo = s.get("outlook")
     brief = fallback_brief(s)
     r, g, b = tc_color(s.get("vmax"), s.get("invest"))
@@ -1696,52 +1601,6 @@ def render_tc_card(s, ai_on=False):
         st.caption(f"{s['pos'][1]:.1f}°, {s['pos'][0]:.1f}° · {s['time']}")
         if s.get("url"):
             st.markdown(f"[NHC source ↗]({s['url']})")
-
-def render_headline(events, tropical_systems):
-    combined = [tc_to_map_event(s) for s in tropical_systems if not s.get("invest")] + list(events)
-
-    def brief_score(event):
-        score = 0
-        source = event.get("source", "")
-        peril = event.get("peril", "")
-        severity = event.get("severity", "Info")
-        alert = event.get("alert_level", "Unknown")
-        dt = event_timestamp(event)
-        age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600 if dt else 9999
-
-        score += {"Critical": 100, "Watch": 70, "Advisory": 25, "Info": 5}.get(severity, 0)
-        score += {"Red": 45, "Orange": 25, "Green": 5}.get(alert, 0)
-        if source in ("NHC", "JTWC") or peril == "Tropical Cyclone":
-            score += 50
-        if source == "GDACS" and alert in ("Red", "Orange"):
-            score += 35
-        if source == "CAL FIRE" and severity in ("Critical", "Watch"):
-            score += 20
-        if source == "GDELT" and severity == "Watch":
-            score += 15
-        if age_hours <= 24:
-            score += 25
-        elif age_hours <= 72:
-            score += 10
-        elif age_hours > 168:
-            score -= 150
-        return score
-
-    candidates = [e for e in combined if brief_score(e) >= 70]
-    candidates.sort(key=lambda e: (-brief_score(e), severity_rank(e.get("severity")), -(event_timestamp(e).timestamp() if event_timestamp(e) else 0)))
-
-    st.subheader("Morning brief")
-    st.caption("Ranked by severity, official alert level, source importance, and recency. Stale low-severity items are intentionally suppressed.")
-    if not candidates:
-        st.success("No high-priority current events in the active source set.")
-        return
-    for e in candidates[:8]:
-        metric = f" · {e.get('metric_text')}" if e.get("metric_text") else ""
-        st.markdown(
-            f"**{peril_icon(e.get('peril'))} {e.get('severity')} · {e.get('peril')} · {e.get('title')}**{metric}  "
-            f"<span class='cw-muted'>{e.get('source', '')} · {e.get('time', '—')}</span>",
-            unsafe_allow_html=True,
-        )
 
 def render_monitoring_summary(map_events):
     if not map_events:
@@ -1868,14 +1727,6 @@ def filter_events_by_recency(events, max_age_hours=None):
     return filtered
 
 
-def sort_events_for_live_view(events):
-    def sort_key(event):
-        dt = event_timestamp(event)
-        timestamp = dt.timestamp() if dt else 0
-        return (severity_rank(event.get("severity")), -timestamp, ALERT_ORDER.get(event.get("alert_level"), 9), event.get("title", ""))
-    return sorted(events, key=sort_key)
-
-
 def render_non_hurricane_summary(events, source_hint=None):
     total = len(events)
     counts = {level: sum(1 for e in events if e.get("severity") == level) for level in ["Critical", "Watch", "Advisory", "Info"]}
@@ -1914,20 +1765,6 @@ def recency_filter_widget(title):
         key=f"{title.lower().replace(' ', '_')}_recency",
     )
     return options[label]
-
-
-def render_gemini_diagnostics():
-    with st.expander("Gemini key diagnostics", expanded=False):
-        has_key = bool(gemini_key())
-        st.write(f"GEMINI_API_KEY detected by Streamlit secrets: **{'Yes' if has_key else 'No'}**")
-        st.write(f"google-genai import available: **{'Yes' if genai is not None else 'No'}**")
-        if has_key and genai is not None:
-            model = gemini_model()
-            st.write(f"Selected Gemini model: **{model or 'None'}**")
-            if _AI_ERROR.get("msg"):
-                st.caption(f"Last Gemini error: {_AI_ERROR['msg']}")
-        else:
-            st.caption("For local runs, create .streamlit/secrets.toml. For Streamlit Cloud, set the secret in the app settings. Do not commit secrets.toml.")
 
 
 def render_gdelt_diagnostics(events=None):
@@ -2100,26 +1937,6 @@ def render_custom_feed_tab():
 
     for event in events[:100]:
         render_custom_feed_card(event)
-
-def render_data_table(tropical_systems, gdacs_events, calfire_events, civil_unrest_events):
-    rows = []
-    for s in tropical_systems:
-        rows.append(tc_to_map_event(s))
-    rows.extend(gdacs_events)
-    rows.extend(calfire_events)
-    rows.extend(civil_unrest_events)
-    if not rows:
-        st.info("No events loaded.")
-        return
-    df = pd.DataFrame(rows)
-    keep = ["severity", "peril", "source", "title", "metric_text", "time", "lat", "lon", "url"]
-    for col in keep:
-        if col not in df.columns:
-            df[col] = None
-    df["severity_rank"] = df["severity"].map(SEVERITY_ORDER).fillna(9)
-    df = df.sort_values(["severity_rank", "peril", "source", "title"]).drop(columns=["severity_rank"])
-    st.dataframe(df[keep], width="stretch", hide_index=True, column_config={"url": st.column_config.LinkColumn("Source")})
-
 
 def app():
     st.title("☄️ CatWatch ☄️")
