@@ -1648,7 +1648,7 @@ def render_monitoring_summary(map_events):
 
 
 def select_marker_style(key):
-    options = ["Severity", "Peril"]
+    options = ["Severity colors", "Peril colors"]
     if hasattr(st, "segmented_control"):
         return st.segmented_control("Display", options, default=options[0], key=key)
     return st.radio("Display", options, horizontal=True, key=key)
