@@ -9,4 +9,7 @@ feedparser>=6.0.0
 tropycal>=1.0
 matplotlib>=3.8.0
 shapely>=2.0.0
+cartopy>=0.22.0
+pyproj>=3.6.0
+pyshp>=2.3.1
 google-genai>=0.1.0
